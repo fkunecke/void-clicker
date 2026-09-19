@@ -96,44 +96,35 @@ BUTTONS = {
 # encounter) lands in the same spot the sell button was in.
 ATTACK_BUTTON_LOCATION = SELL_BUTTON_LOCATION
 
-# How long to wait after clicking sell/salvage/stash before the item box has
-# closed and the attack button has taken its place at that same spot. Tune
-# this up if the attack click seems to land before the box actually closes.
-ATTACK_DELAY = 0.3
-
-# After an attack tap confirms a drop has appeared, wait this long before
-# doing the detailed read (rarity/health) -- the box may register as
-# "present" in a coarse sense before it's finished fading in / rendering.
-POST_ATTACK_SETTLE = 0.5
+# How long to wait after clicking sell/salvage/stash before attacking again.
+ATTACK_DELAY = 0.1
 
 # iPhone Mirroring translates mouse input into touches, and an instant
 # move-then-click (near-zero dwell/press time) doesn't always register as a
 # tap. CLICK_SETTLE lets the cursor "arrive" before pressing down;
-# CLICK_HOLD is how long to hold the press before releasing. Raise these if
-# clicks are still being dropped.
-CLICK_SETTLE = 0.1
-CLICK_HOLD = 0.15
+# CLICK_HOLD is how long to hold the press before releasing. These are the
+# main lever if taps start getting silently dropped again -- raise these
+# two specifically before touching anything else below.
+CLICK_SETTLE = 0.05
+CLICK_HOLD = 0.08
 
 # Tuning the tap itself only goes so far -- taps still get silently dropped
 # sometimes. Instead of hoping the timing is exactly right, verify each tap
 # actually did something (via our own drop detection) and retry if it
 # didn't, rather than blindly moving on.
 TAP_RETRY_ATTEMPTS = 3
-TAP_POLL_INTERVAL = 0.15
+TAP_POLL_INTERVAL = 0.05
 # How many consecutive polls must agree before something is considered
 # confirmed (guards against a single-frame flicker looking like the truth).
 CONFIRM_POLLS = 2
 # How long to wait for a sell/salvage/stash tap to close the item box.
-ACTION_CONFIRM_TIMEOUT = 1.5
-# How long to wait for an attack tap to produce a new drop (the encounter
-# itself takes a second or two).
-ATTACK_CONFIRM_TIMEOUT = 3.0
-# Max time to spend trying to get a stable (non-flickering) rarity/health
-# reading before giving up and using whatever was last seen.
-STABLE_READ_TIMEOUT = 2.0
+ACTION_CONFIRM_TIMEOUT = 1.0
+# How long to wait for an attack tap to produce a new, stable drop rarity
+# (the encounter itself takes a second or two).
+ATTACK_CONFIRM_TIMEOUT = 2.0
 # How often to check while waiting for a manual (eldritch) item to be
 # dismissed by hand.
-MANUAL_POLL_INTERVAL = 0.5
+MANUAL_POLL_INTERVAL = 0.3
 
 # If the mouse ends up somewhere other than where the script itself last put
 # it (i.e. you touch it) during the automated part of a cycle, stop rather
@@ -271,25 +262,6 @@ def timestamp():
     return datetime.now().strftime("%H:%M:%S")
 
 
-def read_stable(sample, confirm_polls=CONFIRM_POLLS, timeout=STABLE_READ_TIMEOUT):
-    """Call sample() repeatedly until the same value comes back confirm_polls times in a
-    row (the item box's fade animation can otherwise make a single read unreliable), or
-    give up at timeout and return whatever was last seen."""
-    candidate, streak = None, 0
-    deadline = time.time() + timeout
-    value = None
-    while time.time() < deadline:
-        check_mouse_untouched()
-        value = sample()
-        if value == candidate:
-            streak += 1
-            if streak >= confirm_polls:
-                return value
-        else:
-            candidate, streak = value, 1
-        time.sleep(TAP_POLL_INTERVAL)
-    return value
-
 
 class ManualOverride(Exception):
     """Raised when the mouse has moved somewhere the script didn't put it."""
@@ -353,6 +325,30 @@ def tap_until(location, confirmed, description, timeout):
         print(f"[{timestamp()}] {description}: tap not confirmed (attempt {attempt}/{TAP_RETRY_ATTEMPTS})")
     print(f"[{timestamp()}] {description}: giving up after {TAP_RETRY_ATTEMPTS} attempts")
     return False
+
+
+def tap_until_stable(location, sample, description, timeout):
+    """Tap location, retrying if needed, until sample() returns the same non-None
+    value CONFIRM_POLLS times in a row. Combines "confirm the tap did something"
+    and "wait for a stable, non-flickering reading" into one poll instead of two
+    sequential ones. Returns that value, or None if it never stabilizes."""
+    for attempt in range(1, TAP_RETRY_ATTEMPTS + 1):
+        tap(*location)
+        deadline = time.time() + timeout
+        candidate, streak = None, 0
+        while time.time() < deadline:
+            check_mouse_untouched()
+            value = sample()
+            if value is not None and value == candidate:
+                streak += 1
+                if streak >= CONFIRM_POLLS:
+                    return value
+            else:
+                candidate, streak = value, (1 if value is not None else 0)
+            time.sleep(TAP_POLL_INTERVAL)
+        print(f"[{timestamp()}] {description}: tap not confirmed (attempt {attempt}/{TAP_RETRY_ATTEMPTS})")
+    print(f"[{timestamp()}] {description}: giving up after {TAP_RETRY_ATTEMPTS} attempts")
+    return None
 
 
 def calibrate():
@@ -425,17 +421,24 @@ def monitor():
     total_sold = 0
     total_salvaged = 0
 
+    # Wherever we last tapped becomes the attack button once its box closes
+    # (it replaces the whole button bar), so reuse that spot for the next
+    # attack instead of moving back to a separate fixed location.
+    attack_location = ATTACK_BUTTON_LOCATION
+
     try:
         while True:
-            # 1. Attack, and don't move on until an item has actually dropped.
-            tap_until(ATTACK_BUTTON_LOCATION, lambda: classify_icon(DROP_REGION) is not None,
-                      "attack", ATTACK_CONFIRM_TIMEOUT)
-            guarded_sleep(POST_ATTACK_SETTLE)
+            # 1. Attack, and don't move on until the drop's rarity is stable --
+            # folds "confirm the tap landed" and "wait for a clean read" into
+            # one poll instead of two sequential ones.
+            drop_rarity = tap_until_stable(attack_location, lambda: classify_icon(DROP_REGION),
+                                            "attack", ATTACK_CONFIRM_TIMEOUT)
 
-            # 2. Capture the screen: what dropped, what's equipped, health.
-            drop_rarity = read_stable(lambda: classify_icon(DROP_REGION))
-            equipped_rarity = read_stable(lambda: classify_icon(EQUIPPED_REGION))
-            health = read_stable(read_health)
+            # 2. Equipped/health don't gate any decision, so a single read is
+            # enough -- the box has already settled by the time drop_rarity
+            # resolved above.
+            equipped_rarity = classify_icon(EQUIPPED_REGION)
+            health = read_health()
 
             total_drops += 1
             action = ACTIONS.get(drop_rarity)
@@ -453,8 +456,10 @@ def monitor():
             if action in BUTTONS:
                 tap_until(BUTTONS[action], lambda: classify_icon(DROP_REGION) is None,
                           f"{action} click", ACTION_CONFIRM_TIMEOUT)
+                attack_location = BUTTONS[action]
             else:
                 wait_for_manual_dismissal()
+                attack_location = ATTACK_BUTTON_LOCATION
 
             # 4. We're confirmed out of combat (drop region reads none) at this
             # point either way -- loop back and attack again.
