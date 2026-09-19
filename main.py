@@ -7,7 +7,7 @@ confirmed, clicks the corresponding sell/salvage/stash button per ACTIONS.
 clicked -- left for you to handle by hand.
 
 SETUP (one-time):
-  pip3 install pyautogui pillow numpy
+  pip3 install pyautogui mss numpy
   Then grant Terminal (or your IDE) access under:
     System Settings > Privacy & Security > Accessibility
     System Settings > Privacy & Security > Screen Recording
@@ -24,16 +24,24 @@ USAGE:
      dropped/equipped on screen to see per-rarity match scores live:
        python3 main.py debug
 
-  4. Run the monitor:
+  4. To see how much of the cycle time is actual screen-capture latency
+     (vs. the configured sleep constants), run:
+       python3 main.py timing
+
+  5. Run the monitor:
        python3 main.py monitor
 """
 
 import sys
 import time
 from datetime import datetime
+import mss
 import numpy as np
 import pyautogui
-from PIL import ImageGrab
+
+# One persistent capture instance -- creating a fresh mss.mss() per call has
+# its own setup overhead, so reuse it across every grab in the process.
+_sct = mss.mss()
 
 # ---------------- CONFIG (edit these) ----------------
 
@@ -115,7 +123,10 @@ CLICK_HOLD = 0.05
 # actually did something (via our own drop detection) and retry if it
 # didn't, rather than blindly moving on.
 TAP_RETRY_ATTEMPTS = 3
-TAP_POLL_INTERVAL = 0.03
+# Now that a capture itself only takes ~15-40ms (post-mss), this mainly just
+# needs to be non-zero so the poll loop doesn't hammer the CPU -- the capture
+# call itself, not this sleep, is what paces each poll.
+TAP_POLL_INTERVAL = 0.01
 # How many consecutive polls must agree before something is considered
 # confirmed (guards against a single-frame flicker looking like the truth).
 CONFIRM_POLLS = 2
@@ -167,6 +178,17 @@ MIN_COMBINED_FRACTION = 0.75
 # Pixel to sample for the health bar/indicator color.
 HEALTH_POINT = (1953, 206)
 
+# A checkpoint further along the health bar, at roughly the 95% mark. If
+# health has filled the bar out this far, this pixel reads the same "good"
+# color as HEALTH_POINT; otherwise it's past the fill and reads the bar's
+# empty/background color. Lets us distinguish "good tier" from "near max"
+# instead of just the coarse good/ok/low tier.
+MAX_HEALTH_POINT = (2074, 206)
+
+# If True, attacking also requires the bar to be filled to MAX_HEALTH_POINT
+# (near max), not just in the "good" tier overall.
+REQUIRE_MAX_HEALTH = True
+
 # If the user is hovering over a non-UI element it will probably be close to
 # this color (useful during calibration to confirm you're on/off a real
 # element).
@@ -197,21 +219,18 @@ def classify_color(color, color_map, tolerance):
     return best_label
 
 
-def get_average_color(region):
-    """Average color of a region (more robust than a single pixel)."""
-    img = ImageGrab.grab(bbox=region).convert("RGB")
-    pixels = list(img.getdata())
-    n = len(pixels)
-    r = sum(p[0] for p in pixels) / n
-    g = sum(p[1] for p in pixels) / n
-    b = sum(p[2] for p in pixels) / n
-    return (r, g, b)
-
-
 def grab_region_array(region):
     """Region screenshot as an (H, W, 3) int32 array."""
-    img = ImageGrab.grab(bbox=region).convert("RGB")
-    return np.asarray(img, dtype=np.int32)
+    left, top, right, bottom = region
+    shot = _sct.grab({"left": left, "top": top, "width": right - left, "height": bottom - top})
+    arr = np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3)
+    return arr.astype(np.int32)
+
+
+def get_average_color(region):
+    """Average color of a region (more robust than a single pixel)."""
+    arr = grab_region_array(region)
+    return tuple(arr.reshape(-1, 3).mean(axis=0))
 
 
 def color_mask(arr, color, tolerance):
@@ -389,6 +408,38 @@ def debug_scan():
         print("\nStopped.")
 
 
+def benchmark():
+    """Measure how long the actual screen-capture calls take on this machine, so
+    the fixed sleep constants aren't the only known part of the cycle-time budget."""
+    samples = 15
+
+    def time_calls(label, fn):
+        times = []
+        for _ in range(samples):
+            start = time.time()
+            fn()
+            times.append(time.time() - start)
+        avg = sum(times) / len(times)
+        print(f"{label}: avg={avg * 1000:.1f}ms  min={min(times) * 1000:.1f}ms  max={max(times) * 1000:.1f}ms")
+        return avg
+
+    print(f"Timing {samples} samples each (point the game at whatever's normally on "
+          f"screen -- content doesn't affect capture cost)...\n")
+    drop_avg = time_calls("drop region classify_icon()", lambda: classify_icon(DROP_REGION))
+    equipped_avg = time_calls("equipped region classify_icon()", lambda: classify_icon(EQUIPPED_REGION))
+    health_avg = time_calls("health read_health()", read_health)
+
+    # Per cycle: 2 drop captures in the attack tap_until_stable, 1 equipped
+    # capture, 2 more drop captures in the action tap_until, 2 health reads.
+    captures = 4 * drop_avg + equipped_avg + 2 * health_avg
+    fixed_sleeps = 2 * (CLICK_SETTLE + CLICK_HOLD + TAP_POLL_INTERVAL) + ATTACK_DELAY
+
+    print(f"\nFixed sleeps per cycle (from config constants): {fixed_sleeps:.3f}s")
+    print(f"Measured screen-capture time per cycle (4 drop + 1 equipped + 2 health): "
+          f"{captures:.3f}s")
+    print(f"Estimated best-case cycle time: {fixed_sleeps + captures:.3f}s")
+
+
 def print_status(health, inventory_used, total_drops, total_sold, total_salvaged,
                   drop_rarity, equipped_rarity, action):
     print(f"[{timestamp()}]")
@@ -409,6 +460,13 @@ def read_health():
     return classify_color(color, HEALTH_COLORS, HEALTH_TOLERANCE)
 
 
+def is_near_max_health():
+    """True if the health bar is filled out to the MAX_HEALTH_POINT checkpoint."""
+    color = get_average_color(
+        (MAX_HEALTH_POINT[0], MAX_HEALTH_POINT[1], MAX_HEALTH_POINT[0] + 1, MAX_HEALTH_POINT[1] + 1))
+    return classify_color(color, HEALTH_COLORS, HEALTH_TOLERANCE) == "good"
+
+
 def wait_for_manual_dismissal():
     # Handling this by hand means touching the mouse, which is expected here --
     # disarm the override check until the next tap re-establishes where we are.
@@ -419,20 +477,24 @@ def wait_for_manual_dismissal():
         time.sleep(MANUAL_POLL_INTERVAL)
 
 
+def is_healthy_enough():
+    if read_health() != "good":
+        return False
+    return not REQUIRE_MAX_HEALTH or is_near_max_health()
+
+
 def wait_for_healthy():
-    """Pause attacking until health reads exactly "good" (the highest tier). You
-    may need to heal by hand while this waits, so the mouse-override check is
-    disarmed meanwhile."""
+    """Pause attacking until health is "good" (and, if REQUIRE_MAX_HEALTH, also
+    filled to the near-max checkpoint). You may need to heal by hand while this
+    waits, so the mouse-override check is disarmed meanwhile."""
     global _expected_mouse_pos
-    health = read_health()
-    if health == "good":
+    if is_healthy_enough():
         return
     _expected_mouse_pos = None
-    print(f"[{timestamp()}] health is {health or 'unknown'}, waiting for good before attacking...")
-    while health != "good":
+    print(f"[{timestamp()}] health not high enough yet, waiting before attacking...")
+    while not is_healthy_enough():
         time.sleep(HEALTH_POLL_INTERVAL)
-        health = read_health()
-    print(f"[{timestamp()}] health is good, resuming.")
+    print(f"[{timestamp()}] health is high enough, resuming.")
 
 
 def monitor():
@@ -504,5 +566,7 @@ if __name__ == "__main__":
         monitor()
     elif mode == "debug":
         debug_scan()
+    elif mode == "timing":
+        benchmark()
     else:
-        print("Usage: python3 main.py [calibrate|monitor|debug]")
+        print("Usage: python3 main.py [calibrate|monitor|debug|timing]")
