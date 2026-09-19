@@ -97,7 +97,9 @@ BUTTONS = {
 ATTACK_BUTTON_LOCATION = SELL_BUTTON_LOCATION
 
 # How long to wait after clicking sell/salvage/stash before attacking again.
-ATTACK_DELAY = 0.1
+# tap_until() for that click already waited for the box to confirm closed,
+# so this is just a tiny safety margin, not a real settle time anymore.
+ATTACK_DELAY = 0.02
 
 # iPhone Mirroring translates mouse input into touches, and an instant
 # move-then-click (near-zero dwell/press time) doesn't always register as a
@@ -105,15 +107,15 @@ ATTACK_DELAY = 0.1
 # CLICK_HOLD is how long to hold the press before releasing. These are the
 # main lever if taps start getting silently dropped again -- raise these
 # two specifically before touching anything else below.
-CLICK_SETTLE = 0.05
-CLICK_HOLD = 0.08
+CLICK_SETTLE = 0.03
+CLICK_HOLD = 0.05
 
 # Tuning the tap itself only goes so far -- taps still get silently dropped
 # sometimes. Instead of hoping the timing is exactly right, verify each tap
 # actually did something (via our own drop detection) and retry if it
 # didn't, rather than blindly moving on.
 TAP_RETRY_ATTEMPTS = 3
-TAP_POLL_INTERVAL = 0.05
+TAP_POLL_INTERVAL = 0.03
 # How many consecutive polls must agree before something is considered
 # confirmed (guards against a single-frame flicker looking like the truth).
 CONFIRM_POLLS = 2
@@ -125,6 +127,10 @@ ATTACK_CONFIRM_TIMEOUT = 2.0
 # How often to check while waiting for a manual (eldritch) item to be
 # dismissed by hand.
 MANUAL_POLL_INTERVAL = 0.3
+
+# Attack only when health reads "good" (the highest tier) -- "ok" and "low"
+# both pause it. How often to re-check health while paused.
+HEALTH_POLL_INTERVAL = 0.5
 
 # If the mouse ends up somewhere other than where the script itself last put
 # it (i.e. you touch it) during the automated part of a cycle, stop rather
@@ -413,6 +419,22 @@ def wait_for_manual_dismissal():
         time.sleep(MANUAL_POLL_INTERVAL)
 
 
+def wait_for_healthy():
+    """Pause attacking until health reads exactly "good" (the highest tier). You
+    may need to heal by hand while this waits, so the mouse-override check is
+    disarmed meanwhile."""
+    global _expected_mouse_pos
+    health = read_health()
+    if health == "good":
+        return
+    _expected_mouse_pos = None
+    print(f"[{timestamp()}] health is {health or 'unknown'}, waiting for good before attacking...")
+    while health != "good":
+        time.sleep(HEALTH_POLL_INTERVAL)
+        health = read_health()
+    print(f"[{timestamp()}] health is good, resuming.")
+
+
 def monitor():
     print("Monitoring. Press Ctrl+C to stop.\n")
 
@@ -428,15 +450,19 @@ def monitor():
 
     try:
         while True:
-            # 1. Attack, and don't move on until the drop's rarity is stable --
+            # 1. Don't attack unless health is ok.
+            wait_for_healthy()
+
+            # 2. Attack, and don't move on until the drop's rarity is stable --
             # folds "confirm the tap landed" and "wait for a clean read" into
             # one poll instead of two sequential ones.
             drop_rarity = tap_until_stable(attack_location, lambda: classify_icon(DROP_REGION),
                                             "attack", ATTACK_CONFIRM_TIMEOUT)
 
-            # 2. Equipped/health don't gate any decision, so a single read is
+            # 3. Equipped health doesn't gate any decision, so a single read is
             # enough -- the box has already settled by the time drop_rarity
-            # resolved above.
+            # resolved above. Re-read health too (it may have changed since
+            # step 1, e.g. from the encounter that just happened).
             equipped_rarity = classify_icon(EQUIPPED_REGION)
             health = read_health()
 
@@ -452,7 +478,7 @@ def monitor():
             print_status(health, inventory_used, total_drops, total_sold, total_salvaged,
                          drop_rarity, equipped_rarity, action)
 
-            # 3. Perform the action, if we have a button for it.
+            # 4. Perform the action, if we have a button for it.
             if action in BUTTONS:
                 tap_until(BUTTONS[action], lambda: classify_icon(DROP_REGION) is None,
                           f"{action} click", ACTION_CONFIRM_TIMEOUT)
@@ -461,8 +487,8 @@ def monitor():
                 wait_for_manual_dismissal()
                 attack_location = ATTACK_BUTTON_LOCATION
 
-            # 4. We're confirmed out of combat (drop region reads none) at this
-            # point either way -- loop back and attack again.
+            # 5. We're confirmed out of combat (drop region reads none) at this
+            # point either way -- loop back and check health/attack again.
             guarded_sleep(ATTACK_DELAY)
     except ManualOverride:
         print(f"\n[{timestamp()}] Mouse moved manually -- stopping.")
