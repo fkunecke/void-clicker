@@ -18,6 +18,13 @@ import mss
 import numpy as np
 import pyautogui
 
+# pyautogui silently sleeps this long after EVERY call (moveTo, mouseDown,
+# mouseUp, etc.) by default -- 0.1s each, so tap()'s three calls would add
+# 0.3s of hidden overhead per tap on top of our own explicit CLICK_SETTLE/
+# CLICK_HOLD tuning, which already serves the same "let the click register"
+# purpose. Disable it; we control click timing ourselves.
+pyautogui.PAUSE = 0
+
 # One persistent capture instance -- creating a fresh mss.mss() per call has
 # its own setup overhead, so reuse it across every grab in the process.
 _sct = mss.mss()
@@ -206,8 +213,8 @@ ATTACK_DELAY = 0.05
 # CLICK_HOLD is how long to hold the press before releasing. These are the
 # main lever if taps start getting silently dropped again -- raise these
 # two specifically before touching anything else below.
-CLICK_SETTLE = 0.05
-CLICK_HOLD = 0.08
+CLICK_SETTLE = 0.03
+CLICK_HOLD = 0.05
 
 # Tuning the tap itself only goes so far -- taps still get silently dropped
 # sometimes. Instead of hoping the timing is exactly right, verify each tap
@@ -223,7 +230,7 @@ TAP_RETRY_ATTEMPTS = 3
 TAP_POLL_INTERVAL = 0.06
 # How many consecutive polls must agree before something is considered
 # confirmed (guards against a single-frame flicker looking like the truth).
-CONFIRM_POLLS = 3
+CONFIRM_POLLS = 1
 # How long to wait for a sell/salvage/stash tap to close the item box.
 ACTION_CONFIRM_TIMEOUT = 1.0
 # How long to wait for an attack tap to flip the tab bar to "dropped".
@@ -416,34 +423,50 @@ def tap(x, y):
     _expected_mouse_pos = (x, y)
 
 
-def tap_until(location, confirmed, description, timeout):
+def tap_until(location, confirmed, description, timeout, quiet=False, stats=None):
     """Tap location and poll confirmed() for its effect; retry the tap if it
     never shows up. confirmed() must return True for CONFIRM_POLLS polls
-    in a row (not just once) before the tap counts as having landed."""
+    in a row (not just once) before the tap counts as having landed. quiet
+    suppresses the per-attempt logging (used by live mode). If stats is a
+    dict, records "polls" (total confirmed() calls) and "attempts" -- lets
+    callers tell "needed many polls" (e.g. a slow animation) apart from
+    "each poll was slow" (capture overhead)."""
+    total_polls = 0
     for attempt in range(1, TAP_RETRY_ATTEMPTS + 1):
-        print(f"[{timestamp()}] tapping {description} at {location} (attempt {attempt}/{TAP_RETRY_ATTEMPTS})")
+        if not quiet:
+            print(f"[{timestamp()}] tapping {description} at {location} (attempt {attempt}/{TAP_RETRY_ATTEMPTS})")
         tap(*location)
         deadline = time.time() + timeout
         streak = 0
         while time.time() < deadline:
             check_mouse_untouched()
+            total_polls += 1
             if confirmed():
                 streak += 1
                 if streak >= CONFIRM_POLLS:
+                    if stats is not None:
+                        stats["polls"] = total_polls
+                        stats["attempts"] = attempt
                     return True
             else:
                 streak = 0
             time.sleep(TAP_POLL_INTERVAL)
-        print(f"[{timestamp()}] {description}: tap not confirmed (attempt {attempt}/{TAP_RETRY_ATTEMPTS})")
-    print(f"[{timestamp()}] {description}: giving up after {TAP_RETRY_ATTEMPTS} attempts")
+        if not quiet:
+            print(f"[{timestamp()}] {description}: tap not confirmed (attempt {attempt}/{TAP_RETRY_ATTEMPTS})")
+    if stats is not None:
+        stats["polls"] = total_polls
+        stats["attempts"] = TAP_RETRY_ATTEMPTS
+    if not quiet:
+        print(f"[{timestamp()}] {description}: giving up after {TAP_RETRY_ATTEMPTS} attempts")
     return False
 
 
-def tap_until_state(location, expected_state, description, timeout):
+def tap_until_state(location, expected_state, description, timeout, quiet=False, stats=None):
     """Tap location until the tab bar reports expected_state ("ready" or
     "dropped") -- an unambiguous, rarity-independent game-state signal, used
     instead of trying to infer game phase from the item box's own colors."""
-    return tap_until(location, lambda: read_tab_bar_state() == expected_state, description, timeout)
+    return tap_until(location, lambda: read_tab_bar_state() == expected_state, description, timeout,
+                      quiet=quiet, stats=stats)
 
 
 def debug():
@@ -711,6 +734,29 @@ def print_status(health, inventory_used, total_drops, total_sold, total_salvaged
     print()
 
 
+def print_status_inline(health, inventory_used, total_drops, total_sold, total_salvaged,
+                         drop_rarity, equipped_rarity, action, first):
+    """Same fields as print_status, but rewrites the same block in place (ANSI
+    cursor-up + clear-line) instead of appending a new one each cycle -- used
+    by live mode so watching timing doesn't flood the console."""
+    lines = [
+        f"[{timestamp()}]",
+        f"health: {health or 'unknown'}",
+        f"inventory: {inventory_used}/{INVENTORY_CAPACITY}",
+        f"total drops: {total_drops}",
+        f"total sold: {total_sold}",
+        f"total salvaged: {total_salvaged}",
+        f"drop: {drop_rarity or 'none'}",
+        f"equipped: {equipped_rarity or 'none'}",
+        f"suggested action: {action or 'none'}",
+    ]
+    if not first:
+        sys.stdout.write(f"\033[{len(lines)}A")
+    for line in lines:
+        sys.stdout.write("\033[K" + line + "\n")
+    sys.stdout.flush()
+
+
 def read_health():
     color = get_average_color(
         (HEALTH_POINT[0], HEALTH_POINT[1], HEALTH_POINT[0] + 1, HEALTH_POINT[1] + 1))
@@ -748,12 +794,13 @@ def is_near_max_health():
     return classify_color(color, HEALTH_COLORS, HEALTH_TOLERANCE) == "good"
 
 
-def wait_for_manual_dismissal():
+def wait_for_manual_dismissal(quiet=False):
     # Handling this by hand means touching the mouse, which is expected here --
     # disarm the override check until the next tap re-establishes where we are.
     global _expected_mouse_pos
     _expected_mouse_pos = None
-    print(f"[{timestamp()}] waiting for you to handle this one...")
+    if not quiet:
+        print(f"[{timestamp()}] waiting for you to handle this one...")
     while read_tab_bar_state() != "ready":
         time.sleep(MANUAL_POLL_INTERVAL)
 
@@ -764,7 +811,7 @@ def is_healthy_enough():
     return not REQUIRE_MAX_HEALTH or is_near_max_health()
 
 
-def wait_for_healthy():
+def wait_for_healthy(quiet=False):
     """Pause attacking until health is "good" (and, if REQUIRE_MAX_HEALTH, also
     filled to the near-max checkpoint). You may need to heal by hand while this
     waits, so the mouse-override check is disarmed meanwhile."""
@@ -772,10 +819,12 @@ def wait_for_healthy():
     if is_healthy_enough():
         return
     _expected_mouse_pos = None
-    print(f"[{timestamp()}] health not high enough yet, waiting before attacking...")
+    if not quiet:
+        print(f"[{timestamp()}] health not high enough yet, waiting before attacking...")
     while not is_healthy_enough():
         time.sleep(HEALTH_POLL_INTERVAL)
-    print(f"[{timestamp()}] health is high enough, resuming.")
+    if not quiet:
+        print(f"[{timestamp()}] health is high enough, resuming.")
 
 
 def read_single_key():
@@ -807,13 +856,30 @@ def confirm_settings():
     return read_single_key() != ESCAPE_KEY
 
 
-def auto():
-    if not confirm_settings():
-        print("Cancelled.")
-        return
+def wait_for_tab_bar(expected_state, quiet=False):
+    """Passively wait for the tab bar to reach expected_state, without tapping
+    anything -- used by live's dry-run mode, where you're doing the clicking
+    and this is just watching to verify detection matches what you're seeing."""
+    if not quiet:
+        print(f"[{timestamp()}] waiting for tab bar to read '{expected_state}'...")
+    while read_tab_bar_state() != expected_state:
+        time.sleep(TAP_POLL_INTERVAL)
 
-    print("\nMonitoring. Press Ctrl+C to stop.\n")
 
+def run_cycle_loop(display, quiet, dry_run=False, show_timing=False):
+    """Core attack/read/act loop shared by auto and live -- they differ only in
+    how each cycle's status is displayed and whether per-tap logging is shown.
+    display(health, inventory_used, total_drops, total_sold, total_salvaged,
+    drop_rarity, equipped_rarity, action) is called once per cycle.
+
+    If dry_run, never taps anything: waits for you to attack/act yourself and
+    just verifies detection tracks what actually happens, via the same tab
+    bar signal. inventory/sold/salvaged still track what the suggested
+    action WOULD have done, for comparing against what you actually did.
+
+    If show_timing, prints how long each step of the cycle actually took --
+    real timing from a live run, not the synthetic capture-only numbers from
+    `timing` mode, so it also reflects retries, confirmation waits, etc."""
     inventory_used = INVENTORY_USED
     total_drops = 0
     total_sold = 0
@@ -824,57 +890,127 @@ def auto():
     # attack instead of moving back to a separate fixed location.
     attack_location = ATTACK_BUTTON_LOCATION
 
-    try:
-        while True:
-            # 1. Don't attack unless health is ok.
-            wait_for_healthy()
+    while True:
+        cycle_start = time.time()
 
-            # 2. Attack, confirmed via the tab bar dimming -- an unambiguous
-            # signal that a drop genuinely happened, decoupled from having to
-            # correctly classify the item's rarity to know the state changed.
-            tap_until_state(attack_location, "dropped", "attack", ATTACK_CONFIRM_TIMEOUT)
+        # 1. Don't attack unless health is ok.
+        step_start = time.time()
+        wait_for_healthy(quiet=quiet)
+        t_healthy = time.time() - step_start
 
-            # 3. The tab bar only confirms combat has started, not that the
-            # item box has finished rendering -- keep retrying until both
-            # drop and equipped resolve.
-            drop_rarity, equipped_rarity = read_drop_and_equipped()
-            health = read_health()
+        # 2. Attack, confirmed via the tab bar dimming -- an unambiguous
+        # signal that a drop genuinely happened, decoupled from having to
+        # correctly classify the item's rarity to know the state changed.
+        step_start = time.time()
+        attack_stats = {} if show_timing else None
+        if dry_run:
+            wait_for_tab_bar("dropped", quiet=quiet)
+        else:
+            tap_until_state(attack_location, "dropped", "attack", ATTACK_CONFIRM_TIMEOUT,
+                             quiet=quiet, stats=attack_stats)
+        t_attack = time.time() - step_start
 
-            total_drops += 1
-            action = ACTIONS.get(drop_rarity)
-            if action == "sell":
-                total_sold += 1
-            elif action == "salvage":
-                total_salvaged += 1
-            elif action == "stash":
-                inventory_used += 1
+        # 3. The tab bar only confirms combat has started, not that the
+        # item box has finished rendering -- keep retrying until both
+        # drop and equipped resolve.
+        step_start = time.time()
+        drop_rarity, equipped_rarity = read_drop_and_equipped()
+        health = read_health()
+        t_read = time.time() - step_start
 
-            print_status(health, inventory_used, total_drops, total_sold, total_salvaged,
-                         drop_rarity, equipped_rarity, action)
+        total_drops += 1
+        action = ACTIONS.get(drop_rarity)
+        if action == "sell":
+            total_sold += 1
+        elif action == "salvage":
+            total_salvaged += 1
+        elif action == "stash":
+            inventory_used += 1
 
-            # 4. Perform the action, if we have a button for it, confirmed the
-            # same way -- tab bar back to "ready". If the tap never gets
-            # confirmed, don't loop back into "attack": the box is very
-            # likely still open with this same undismissed item, and the next
-            # attack tap would just re-hit that button on the wrong item.
-            # Pause instead.
-            if action in BUTTONS:
-                action_confirmed = tap_until_state(BUTTONS[action], "ready",
-                                                    f"{action} click", ACTION_CONFIRM_TIMEOUT)
-                if action_confirmed:
-                    attack_location = BUTTONS[action]
-                else:
+        display(health, inventory_used, total_drops, total_sold, total_salvaged,
+                drop_rarity, equipped_rarity, action)
+
+        # 4. Perform the action, if we have a button for it, confirmed the
+        # same way -- tab bar back to "ready". If the tap never gets
+        # confirmed, don't loop back into "attack": the box is very
+        # likely still open with this same undismissed item, and the next
+        # attack tap would just re-hit that button on the wrong item.
+        # Pause instead.
+        step_start = time.time()
+        action_stats = {} if show_timing else None
+        if dry_run:
+            wait_for_tab_bar("ready", quiet=quiet)
+        elif action in BUTTONS:
+            action_confirmed = tap_until_state(BUTTONS[action], "ready", f"{action} click",
+                                                ACTION_CONFIRM_TIMEOUT, quiet=quiet, stats=action_stats)
+            if action_confirmed:
+                attack_location = BUTTONS[action]
+            else:
+                if not quiet:
                     print(f"[{timestamp()}] {action} click never registered -- "
                           f"pausing so you can check this by hand.")
-                    wait_for_manual_dismissal()
-                    attack_location = ATTACK_BUTTON_LOCATION
-            else:
-                wait_for_manual_dismissal()
+                wait_for_manual_dismissal(quiet=quiet)
                 attack_location = ATTACK_BUTTON_LOCATION
+        else:
+            wait_for_manual_dismissal(quiet=quiet)
+            attack_location = ATTACK_BUTTON_LOCATION
+        t_action = time.time() - step_start
 
-            # 5. We're confirmed out of combat (drop region reads none) at this
-            # point either way -- loop back and check health/attack again.
+        # 5. We're confirmed out of combat (drop region reads none) at this
+        # point either way -- loop back and check health/attack again. No
+        # click just happened in dry_run, so there's nothing to buffer for.
+        step_start = time.time()
+        if not dry_run:
             guarded_sleep(ATTACK_DELAY)
+        t_delay = time.time() - step_start
+
+        if show_timing:
+            attack_polls = attack_stats.get("polls", "?") if attack_stats else "n/a"
+            action_polls = action_stats.get("polls", "?") if action_stats else "n/a"
+            print(f"[{timestamp()}] cycle timing: healthy={t_healthy:.2f}s "
+                  f"attack={t_attack:.2f}s({attack_polls} polls) "
+                  f"read={t_read:.2f}s action={t_action:.2f}s({action_polls} polls) "
+                  f"delay={t_delay:.2f}s total={time.time() - cycle_start:.2f}s")
+
+
+def auto(show_timing=False):
+    if not confirm_settings():
+        print("Cancelled.")
+        return
+
+    print("\nMonitoring. Press Ctrl+C to stop.\n")
+
+    try:
+        run_cycle_loop(display=print_status, quiet=False, show_timing=show_timing)
+    except ManualOverride:
+        print(f"\n[{timestamp()}] Mouse moved manually -- stopping.")
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+def live(dry_run=False):
+    """Same as auto, but the status block updates in place (no per-tap logging,
+    no scrolling) so you can watch real cycle timing without flooding the
+    console -- meant for tightening up the timing constants.
+
+    If dry_run, never taps anything: you drive (attack/sell/salvage/stash
+    yourself) and this just verifies the detected state matches what you'd
+    expect, which is safe to run without wiring up real clicks first."""
+    if not confirm_settings():
+        print("Cancelled.")
+        return
+
+    label = "Live mode (--no-click, you drive)" if dry_run else "Live mode"
+    print(f"{label}. Press Ctrl+C to stop.\n")
+
+    state = {"first": True}
+
+    def display(*args):
+        print_status_inline(*args, first=state["first"])
+        state["first"] = False
+
+    try:
+        run_cycle_loop(display=display, quiet=True, dry_run=dry_run)
     except ManualOverride:
         print(f"\n[{timestamp()}] Mouse moved manually -- stopping.")
     except KeyboardInterrupt:
@@ -886,7 +1022,9 @@ if __name__ == "__main__":
     if mode == "calibrate":
         calibrate()
     elif mode == "auto":
-        auto()
+        auto(show_timing="--timing" in sys.argv[2:])
+    elif mode == "live":
+        live(dry_run="--no-click" in sys.argv[2:])
     elif mode == "debug":
         debug()
     elif mode == "debug-drops":
@@ -894,4 +1032,4 @@ if __name__ == "__main__":
     elif mode == "timing":
         benchmark()
     else:
-        print("Usage: python3 main.py [calibrate|auto|debug|debug-drops|timing]")
+        print("Usage: python3 main.py [calibrate|auto [--timing]|live [--no-click]|debug|debug-drops|timing]")

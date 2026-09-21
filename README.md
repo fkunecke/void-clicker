@@ -148,13 +148,46 @@ itself, since they're not machine-specific in the same way.
 ## Modes
 
 ```
-python3 main.py calibrate     # interactive: click each pixel location
-python3 main.py auto          # default mode: run the monitor/auto-triager
-python3 main.py debug         # hover and print live cursor position + color
-python3 main.py debug-drops   # live per-rarity match scores for drop/equipped
-python3 main.py timing        # benchmark actual screen-capture latency
+python3 main.py calibrate         # interactive: click each pixel location
+python3 main.py auto              # default mode: run the monitor/auto-triager
+python3 main.py auto --timing     # like auto, but prints a per-cycle timing breakdown
+python3 main.py live              # same as auto, but for watching/tuning timing
+python3 main.py live --no-click   # like live, but never taps -- you drive, it just verifies detection
+python3 main.py debug             # hover and print live cursor position + color
+python3 main.py debug-drops       # live per-rarity match scores for drop/equipped
+python3 main.py timing            # benchmark actual screen-capture latency
 ```
 
-`auto` prints the current `.env`-derived settings (actions, inventory,
-require-max-health) first and waits for a keypress -- press Escape to bail
-out and edit `.env` yourself, or any other key to start.
+`auto` and `live` both print the current `.env`-derived settings (actions,
+inventory, require-max-health) first and wait for a keypress -- press Escape
+to bail out and edit `.env` yourself, or any other key to start.
+
+`live --no-click` is a safe way to sanity-check detection before trusting it
+to click anything: it never taps, so you attack/sell/salvage/stash yourself
+while it passively watches the tab bar and shows what it detected (drop,
+equipped, suggested action) for each item -- compare that against what you
+actually saw in-game.
+
+`auto --timing` prints one line per cycle like:
+
+```
+cycle timing: healthy=0.00s attack=0.45s(6 polls) read=0.12s action=0.38s(5 polls) delay=0.05s total=1.00s
+```
+
+`healthy` is time spent waiting for `REQUIRE_MAX_HEALTH`/health-tier gating
+(0 if already healthy), `attack` and `action` are the tap-and-confirm steps
+(so they include any retries), `read` is the drop/equipped rarity read, and
+`delay` is the fixed `ATTACK_DELAY` buffer. This is real timing from an
+actual run (registration failures, retries, and all), not the synthetic
+capture-only numbers from `timing` mode -- use it to see which step is
+actually worth tightening. `attack`/`action` also report how many polls it
+took to confirm: many polls means the tab bar genuinely takes that long to
+settle (an animation, not something to optimize away), while few polls but
+still slow time points at capture overhead instead.
+
+`live` runs the exact same cycle logic as `auto` (same taps, same timing,
+same real actions), but instead of the per-tap "tapping X at Y" logging and
+a new status block scrolling by every cycle, it suppresses the tap logging
+and rewrites a single status block in place. Meant for watching real cycle
+timing without flooding the console while tightening up the timing
+constants in the CONFIG section.
