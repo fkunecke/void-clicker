@@ -179,10 +179,26 @@ BUTTONS = {
 # encounter) lands in the same spot the sell button was in.
 ATTACK_BUTTON_LOCATION = SELL_BUTTON_LOCATION
 
+# The bottom tab bar icons are bright/white when ready to attack and dimmed
+# when an item has dropped -- an unambiguous, rarity-independent signal for
+# which phase the game is in, used to gate attack/action taps instead of
+# trying to infer game phase from the item box's own (rarity-dependent)
+# colors. See .env / calibrate.
+TAB_BAR_POINT = required_point("TAB_BAR_POINT")
+TAB_BAR_COLORS = {
+    "ready": parse_point(required_raw("TAB_BAR_READY_COLOR", CALIBRATE_HINT)),
+    "dropped": parse_point(required_raw("TAB_BAR_DROPPED_COLOR", CALIBRATE_HINT)),
+}
+TAB_BAR_TOLERANCE = 30
+
 # How long to wait after clicking sell/salvage/stash before attacking again.
-# tap_until() for that click already waited for the box to confirm closed,
-# so this is just a tiny safety margin, not a real settle time anymore.
-ATTACK_DELAY = 0.02
+# The attack tap reuses the SAME pixel coordinates as the action button, so
+# this is a real safety margin, not just a formality: if it's too short, the
+# next tap can land while the old box is still mid-close-animation, or (worse)
+# while a new item's box is already appearing at that same spot -- meaning
+# "attack" could actually hit that new item's sell/salvage/stash button
+# before its rarity's even been read. Don't cut this much further.
+ATTACK_DELAY = 0.05
 
 # iPhone Mirroring translates mouse input into touches, and an instant
 # move-then-click (near-zero dwell/press time) doesn't always register as a
@@ -190,26 +206,34 @@ ATTACK_DELAY = 0.02
 # CLICK_HOLD is how long to hold the press before releasing. These are the
 # main lever if taps start getting silently dropped again -- raise these
 # two specifically before touching anything else below.
-CLICK_SETTLE = 0.03
-CLICK_HOLD = 0.05
+CLICK_SETTLE = 0.05
+CLICK_HOLD = 0.08
 
 # Tuning the tap itself only goes so far -- taps still get silently dropped
 # sometimes. Instead of hoping the timing is exactly right, verify each tap
 # actually did something (via our own drop detection) and retry if it
 # didn't, rather than blindly moving on.
 TAP_RETRY_ATTEMPTS = 3
-# Now that a capture itself only takes ~15-40ms (post-mss), this mainly just
-# needs to be non-zero so the poll loop doesn't hammer the CPU -- the capture
-# call itself, not this sleep, is what paces each poll.
-TAP_POLL_INTERVAL = 0.01
+# The gap between polls. Together with CONFIRM_POLLS below, this sets how
+# long something has to stay stable before it's trusted -- e.g. with the
+# values below, "confirmed" requires ~2 consecutive intervals (0.12s) of the
+# same reading, comfortably longer than a single flicker frame. Don't cut
+# this much further: at very small values "confirmed" can trigger off a
+# single transient animation frame instead of genuine stability.
+TAP_POLL_INTERVAL = 0.06
 # How many consecutive polls must agree before something is considered
 # confirmed (guards against a single-frame flicker looking like the truth).
-CONFIRM_POLLS = 2
+CONFIRM_POLLS = 3
 # How long to wait for a sell/salvage/stash tap to close the item box.
 ACTION_CONFIRM_TIMEOUT = 1.0
-# How long to wait for an attack tap to produce a new, stable drop rarity
-# (the encounter itself takes a second or two).
+# How long to wait for an attack tap to flip the tab bar to "dropped".
 ATTACK_CONFIRM_TIMEOUT = 2.0
+# The tab bar dims as soon as combat starts, but the item box itself doesn't
+# render until combat finishes (up to ~1s later) -- so right after the tab
+# bar confirms "dropped", the drop/equipped regions can still briefly read as
+# empty. Keep retrying the rarity read until both resolve, up to this long,
+# rather than trusting a single read.
+RARITY_READ_TIMEOUT = 1.5
 # How often to check while waiting for a manual (eldritch) item to be
 # dismissed by hand.
 MANUAL_POLL_INTERVAL = 0.3
@@ -258,9 +282,9 @@ ERROR_COLOR = (19, 15, 35)
 
 # Reference colors for simple health states.
 HEALTH_COLORS = {
-    "good": (129, 85, 200),
-    "ok": (191, 145, 31),
-    "low": (174, 48, 59),
+    "good": (169, 109, 255),
+    "ok": (252, 190, 12),
+    "low": (227, 58, 64),
 }
 HEALTH_TOLERANCE = 30
 
@@ -397,6 +421,7 @@ def tap_until(location, confirmed, description, timeout):
     never shows up. confirmed() must return True for CONFIRM_POLLS polls
     in a row (not just once) before the tap counts as having landed."""
     for attempt in range(1, TAP_RETRY_ATTEMPTS + 1):
+        print(f"[{timestamp()}] tapping {description} at {location} (attempt {attempt}/{TAP_RETRY_ATTEMPTS})")
         tap(*location)
         deadline = time.time() + timeout
         streak = 0
@@ -414,28 +439,11 @@ def tap_until(location, confirmed, description, timeout):
     return False
 
 
-def tap_until_stable(location, sample, description, timeout):
-    """Tap location, retrying if needed, until sample() returns the same non-None
-    value CONFIRM_POLLS times in a row. Combines "confirm the tap did something"
-    and "wait for a stable, non-flickering reading" into one poll instead of two
-    sequential ones. Returns that value, or None if it never stabilizes."""
-    for attempt in range(1, TAP_RETRY_ATTEMPTS + 1):
-        tap(*location)
-        deadline = time.time() + timeout
-        candidate, streak = None, 0
-        while time.time() < deadline:
-            check_mouse_untouched()
-            value = sample()
-            if value is not None and value == candidate:
-                streak += 1
-                if streak >= CONFIRM_POLLS:
-                    return value
-            else:
-                candidate, streak = value, (1 if value is not None else 0)
-            time.sleep(TAP_POLL_INTERVAL)
-        print(f"[{timestamp()}] {description}: tap not confirmed (attempt {attempt}/{TAP_RETRY_ATTEMPTS})")
-    print(f"[{timestamp()}] {description}: giving up after {TAP_RETRY_ATTEMPTS} attempts")
-    return None
+def tap_until_state(location, expected_state, description, timeout):
+    """Tap location until the tab bar reports expected_state ("ready" or
+    "dropped") -- an unambiguous, rarity-independent game-state signal, used
+    instead of trying to infer game phase from the item box's own colors."""
+    return tap_until(location, lambda: read_tab_bar_state() == expected_state, description, timeout)
 
 
 def debug():
@@ -468,25 +476,103 @@ def wait_for_click():
     return clicked_at["pos"]
 
 
+def wait_for_click_or_skip(show_live_color=False):
+    """Block until either a real mouse click or the space bar. Returns
+    ("click", (x, y)) or ("skip", None) -- used so an already-calibrated
+    point can be kept without re-clicking it.
+
+    If show_live_color, prints the color under the cursor as it moves, like a
+    live color picker, updating the same terminal line in place (\\r, no
+    newline) instead of flooding the console with one line per position."""
+    from pynput import keyboard, mouse
+
+    result = {}
+
+    def on_click(x, y, button, pressed):
+        if pressed and "type" not in result:
+            result["type"] = "click"
+            result["pos"] = (int(x), int(y))
+            return False
+
+    def on_press(key):
+        if key == keyboard.Key.space and "type" not in result:
+            result["type"] = "skip"
+            return False
+
+    mouse_listener = mouse.Listener(on_click=on_click)
+    keyboard_listener = keyboard.Listener(on_press=on_press)
+    mouse_listener.start()
+    keyboard_listener.start()
+    while "type" not in result:
+        if show_live_color:
+            x, y = pyautogui.position()
+            color = get_average_color((x, y, x + 1, y + 1))
+            rgb = tuple(int(c) for c in color)
+            print(f"\r  live: ({x}, {y}) color={rgb}" + " " * 10, end="", flush=True)
+        time.sleep(0.02)
+    if show_live_color:
+        print()  # leave the last live reading in place, move to a fresh line
+    mouse_listener.stop()
+    keyboard_listener.stop()
+    return result["type"], result.get("pos")
+
+
 def calibrate():
     """Interactive calibration: click each requested spot in turn to build up
-    HEALTH_POINT, MAX_HEALTH_POINT, DROP_REGION, EQUIPPED_REGION, and the
-    sell/salvage/stash button locations. Rarity colors aren't covered here --
-    use debug for those."""
+    HEALTH_POINT, MAX_HEALTH_POINT, DROP_REGION, EQUIPPED_REGION, the
+    sell/salvage/stash button locations, and the tab bar ready/dropped
+    colors. Rarity colors aren't covered here -- use debug for those."""
     print("Interactive calibration. Click each requested spot when prompted.")
+    print("If a spot is already set in .env, press Space to keep it as-is.")
     print("If clicking does nothing, grant Input Monitoring permission to this")
     print("terminal/IDE under System Settings > Privacy & Security.\n")
 
-    def prompt_point(label):
-        print(f"Click {label}...")
-        x, y = wait_for_click()
+    def existing_point(key):
+        return parse_point(_env[key]) if key in _env else None
+
+    def prompt_point(label, current=None):
+        if current is not None:
+            print(f"Click {label}  (already set to {current} -- press Space to keep it)...")
+            kind, pos = wait_for_click_or_skip(show_live_color=True)
+            if kind == "skip":
+                print(f"  -> kept {current}\n")
+                return current
+        else:
+            print(f"Click {label}...")
+            kind, pos = wait_for_click_or_skip(show_live_color=True)
+        x, y = pos
         print(f"  -> ({x}, {y})\n")
         return (x, y)
 
-    def prompt_health_point(label):
-        while True:
+    def prompt_color_point(label, current_point=None, current_color=None):
+        if current_point is not None and current_color is not None:
+            print(f"Click {label}  (already set: point={current_point} color={current_color} "
+                  f"-- press Space to keep it)...")
+            kind, pos = wait_for_click_or_skip(show_live_color=True)
+            if kind == "skip":
+                print(f"  -> kept point={current_point} color={current_color}\n")
+                return current_point, current_color
+        else:
             print(f"Click {label}...")
-            x, y = wait_for_click()
+            kind, pos = wait_for_click_or_skip(show_live_color=True)
+        x, y = pos
+        color = get_average_color((x, y, x + 1, y + 1))
+        clicked = tuple(int(c) for c in color)
+        print(f"  -> ({x}, {y})  color={clicked}\n")
+        return (x, y), clicked
+
+    def prompt_health_point(label, current=None):
+        while True:
+            if current is not None:
+                print(f"Click {label}  (already set to {current} -- press Space to keep it)...")
+                kind, pos = wait_for_click_or_skip(show_live_color=True)
+                if kind == "skip":
+                    print(f"  -> kept {current}\n")
+                    return current
+            else:
+                print(f"Click {label}...")
+                kind, pos = wait_for_click_or_skip(show_live_color=True)
+            x, y = pos
             color = get_average_color((x, y, x + 1, y + 1))
             clicked = tuple(int(c) for c in color)
             expected = HEALTH_COLORS["good"]
@@ -496,15 +582,35 @@ def calibrate():
             if matches:
                 return (x, y)
 
-    health_point = prompt_health_point("the HEALTH point (main health bar)")
-    max_health_point = prompt_health_point("the MAX HEALTH checkpoint (~95% mark on the health bar)")
-    drop_tl = prompt_point("the DROP region TOP-LEFT corner")
-    drop_br = prompt_point("the DROP region BOTTOM-RIGHT corner")
-    equipped_tl = prompt_point("the EQUIPPED region TOP-LEFT corner")
-    equipped_br = prompt_point("the EQUIPPED region BOTTOM-RIGHT corner")
-    sell_button = prompt_point("the SELL button")
-    salvage_button = prompt_point("the SALVAGE button")
-    stash_button = prompt_point("the STASH button")
+    health_point = prompt_health_point("the HEALTH point (main health bar)", existing_point("HEALTH_POINT"))
+    max_health_point = prompt_health_point(
+        "the MAX HEALTH checkpoint (~95% mark on the health bar)", existing_point("MAX_HEALTH_POINT"))
+
+    existing_drop_region = existing_point("DROP_REGION")
+    drop_tl = prompt_point("the DROP region TOP-LEFT corner",
+                            existing_drop_region[:2] if existing_drop_region else None)
+    drop_br = prompt_point("the DROP region BOTTOM-RIGHT corner",
+                            existing_drop_region[2:] if existing_drop_region else None)
+
+    existing_equipped_region = existing_point("EQUIPPED_REGION")
+    equipped_tl = prompt_point("the EQUIPPED region TOP-LEFT corner",
+                                existing_equipped_region[:2] if existing_equipped_region else None)
+    equipped_br = prompt_point("the EQUIPPED region BOTTOM-RIGHT corner",
+                                existing_equipped_region[2:] if existing_equipped_region else None)
+
+    sell_button = prompt_point("the SELL button", existing_point("SELL_BUTTON_LOCATION"))
+    salvage_button = prompt_point("the SALVAGE button", existing_point("SALVAGE_BUTTON_LOCATION"))
+    stash_button = prompt_point("the STASH button", existing_point("STASH_BUTTON_LOCATION"))
+
+    print("Now the bottom tab bar -- used to tell 'ready to attack' apart from")
+    print("'item dropped' unambiguously, independent of item rarity. Click the")
+    print("SAME spot on the tab bar for both of the following.\n")
+    tab_bar_point, tab_bar_ready_color = prompt_color_point(
+        "a tab bar icon while READY TO ATTACK (icons bright/white)",
+        existing_point("TAB_BAR_POINT"), existing_point("TAB_BAR_READY_COLOR"))
+    _, tab_bar_dropped_color = prompt_color_point(
+        "the SAME tab bar icon while an ITEM IS DROPPED (icons dimmed)",
+        tab_bar_point, existing_point("TAB_BAR_DROPPED_COLOR"))
 
     save_env({
         "HEALTH_POINT": encode_point(health_point),
@@ -514,6 +620,9 @@ def calibrate():
         "SELL_BUTTON_LOCATION": encode_point(sell_button),
         "SALVAGE_BUTTON_LOCATION": encode_point(salvage_button),
         "STASH_BUTTON_LOCATION": encode_point(stash_button),
+        "TAB_BAR_POINT": encode_point(tab_bar_point),
+        "TAB_BAR_READY_COLOR": encode_point(tab_bar_ready_color),
+        "TAB_BAR_DROPPED_COLOR": encode_point(tab_bar_dropped_color),
     })
     print(f"Saved to {_ENV_PATH}")
 
@@ -521,6 +630,9 @@ def calibrate():
 def debug_drops():
     print("Debug-drops mode: best match density per rarity, for each region, every second.")
     print("Point the game at a visible drop/equipped comparison and watch the numbers.")
+    print("Also shows the live tab bar reading -- toggle between ready/dropped in-game")
+    print("and watch whether it actually classifies correctly and how close each")
+    print("distance is to the TAB_BAR_TOLERANCE*3 cutoff.")
     print("Press Ctrl+C to stop.\n")
     try:
         while True:
@@ -530,6 +642,18 @@ def debug_drops():
                 parts = ", ".join(f"{r}(rarity={rd:.2f},combined={cd:.2f})" for r, (rd, cd) in ranked)
                 result = classify_icon(region)
                 print(f"[{timestamp()}] {label} classified={result or 'none'} -- {parts}")
+
+            tab_bar_color = get_average_color(
+                (TAB_BAR_POINT[0], TAB_BAR_POINT[1], TAB_BAR_POINT[0] + 1, TAB_BAR_POINT[1] + 1))
+            tab_bar_clicked = tuple(int(c) for c in tab_bar_color)
+            dist_ready = color_distance(tab_bar_clicked, TAB_BAR_COLORS["ready"])
+            dist_dropped = color_distance(tab_bar_clicked, TAB_BAR_COLORS["dropped"])
+            cutoff = TAB_BAR_TOLERANCE * 3
+            state = read_tab_bar_state()
+            print(f"[{timestamp()}] tab bar classified={state or 'none'} -- color={tab_bar_clicked} "
+                  f"dist_to_ready={dist_ready}{'(within cutoff)' if dist_ready <= cutoff else ''} "
+                  f"dist_to_dropped={dist_dropped}{'(within cutoff)' if dist_dropped <= cutoff else ''} "
+                  f"cutoff={cutoff}")
             print()
             time.sleep(1)
     except KeyboardInterrupt:
@@ -553,18 +677,23 @@ def benchmark():
 
     print(f"Timing {samples} samples each (point the game at whatever's normally on "
           f"screen -- content doesn't affect capture cost)...\n")
+    tab_bar_avg = time_calls("tab bar read_tab_bar_state()", read_tab_bar_state)
     drop_avg = time_calls("drop region classify_icon()", lambda: classify_icon(DROP_REGION))
     equipped_avg = time_calls("equipped region classify_icon()", lambda: classify_icon(EQUIPPED_REGION))
     health_avg = time_calls("health read_health()", read_health)
 
-    # Per cycle: 2 drop captures in the attack tap_until_stable, 1 equipped
-    # capture, 2 more drop captures in the action tap_until, 2 health reads.
-    captures = 4 * drop_avg + equipped_avg + 2 * health_avg
-    fixed_sleeps = 2 * (CLICK_SETTLE + CLICK_HOLD + TAP_POLL_INTERVAL) + ATTACK_DELAY
+    # Per cycle (best case, no retries): CONFIRM_POLLS tab-bar captures each
+    # for the attack and action confirmations, one single-shot drop rarity
+    # read, one equipped read, two health reads (wait_for_healthy + the
+    # post-attack re-read).
+    captures = 2 * CONFIRM_POLLS * tab_bar_avg + drop_avg + equipped_avg + 2 * health_avg
+    # Two taps (attack + action), each needing CONFIRM_POLLS-1 poll intervals
+    # between confirmations, plus the settle margin after the action tap.
+    fixed_sleeps = 2 * (CLICK_SETTLE + CLICK_HOLD) + 2 * (CONFIRM_POLLS - 1) * TAP_POLL_INTERVAL + ATTACK_DELAY
 
     print(f"\nFixed sleeps per cycle (from config constants): {fixed_sleeps:.3f}s")
-    print(f"Measured screen-capture time per cycle (4 drop + 1 equipped + 2 health): "
-          f"{captures:.3f}s")
+    print(f"Measured screen-capture time per cycle "
+          f"({2 * CONFIRM_POLLS} tab bar + 1 drop + 1 equipped + 2 health): {captures:.3f}s")
     print(f"Estimated best-case cycle time: {fixed_sleeps + captures:.3f}s")
 
 
@@ -588,6 +717,30 @@ def read_health():
     return classify_color(color, HEALTH_COLORS, HEALTH_TOLERANCE)
 
 
+def read_tab_bar_state():
+    """'ready' (bright, ok to attack), 'dropped' (dimmed, item showing), or
+    None if neither matches."""
+    color = get_average_color(
+        (TAB_BAR_POINT[0], TAB_BAR_POINT[1], TAB_BAR_POINT[0] + 1, TAB_BAR_POINT[1] + 1))
+    return classify_color(color, TAB_BAR_COLORS, TAB_BAR_TOLERANCE)
+
+
+def read_drop_and_equipped():
+    """Poll drop/equipped rarity until both resolve. The tab bar confirming
+    "dropped" means combat has started, not that the item box has finished
+    rendering, so a single read right after can still legitimately see an
+    empty box for up to ~1s."""
+    deadline = time.time() + RARITY_READ_TIMEOUT
+    drop_rarity = equipped_rarity = None
+    while time.time() < deadline:
+        drop_rarity = classify_icon(DROP_REGION)
+        equipped_rarity = classify_icon(EQUIPPED_REGION)
+        if drop_rarity is not None and equipped_rarity is not None:
+            return drop_rarity, equipped_rarity
+        time.sleep(TAP_POLL_INTERVAL)
+    return drop_rarity, equipped_rarity
+
+
 def is_near_max_health():
     """True if the health bar is filled out to the MAX_HEALTH_POINT checkpoint."""
     color = get_average_color(
@@ -601,7 +754,7 @@ def wait_for_manual_dismissal():
     global _expected_mouse_pos
     _expected_mouse_pos = None
     print(f"[{timestamp()}] waiting for you to handle this one...")
-    while classify_icon(DROP_REGION) is not None:
+    while read_tab_bar_state() != "ready":
         time.sleep(MANUAL_POLL_INTERVAL)
 
 
@@ -676,17 +829,15 @@ def auto():
             # 1. Don't attack unless health is ok.
             wait_for_healthy()
 
-            # 2. Attack, and don't move on until the drop's rarity is stable --
-            # folds "confirm the tap landed" and "wait for a clean read" into
-            # one poll instead of two sequential ones.
-            drop_rarity = tap_until_stable(attack_location, lambda: classify_icon(DROP_REGION),
-                                            "attack", ATTACK_CONFIRM_TIMEOUT)
+            # 2. Attack, confirmed via the tab bar dimming -- an unambiguous
+            # signal that a drop genuinely happened, decoupled from having to
+            # correctly classify the item's rarity to know the state changed.
+            tap_until_state(attack_location, "dropped", "attack", ATTACK_CONFIRM_TIMEOUT)
 
-            # 3. Equipped health doesn't gate any decision, so a single read is
-            # enough -- the box has already settled by the time drop_rarity
-            # resolved above. Re-read health too (it may have changed since
-            # step 1, e.g. from the encounter that just happened).
-            equipped_rarity = classify_icon(EQUIPPED_REGION)
+            # 3. The tab bar only confirms combat has started, not that the
+            # item box has finished rendering -- keep retrying until both
+            # drop and equipped resolve.
+            drop_rarity, equipped_rarity = read_drop_and_equipped()
             health = read_health()
 
             total_drops += 1
@@ -701,11 +852,22 @@ def auto():
             print_status(health, inventory_used, total_drops, total_sold, total_salvaged,
                          drop_rarity, equipped_rarity, action)
 
-            # 4. Perform the action, if we have a button for it.
+            # 4. Perform the action, if we have a button for it, confirmed the
+            # same way -- tab bar back to "ready". If the tap never gets
+            # confirmed, don't loop back into "attack": the box is very
+            # likely still open with this same undismissed item, and the next
+            # attack tap would just re-hit that button on the wrong item.
+            # Pause instead.
             if action in BUTTONS:
-                tap_until(BUTTONS[action], lambda: classify_icon(DROP_REGION) is None,
-                          f"{action} click", ACTION_CONFIRM_TIMEOUT)
-                attack_location = BUTTONS[action]
+                action_confirmed = tap_until_state(BUTTONS[action], "ready",
+                                                    f"{action} click", ACTION_CONFIRM_TIMEOUT)
+                if action_confirmed:
+                    attack_location = BUTTONS[action]
+                else:
+                    print(f"[{timestamp()}] {action} click never registered -- "
+                          f"pausing so you can check this by hand.")
+                    wait_for_manual_dismissal()
+                    attack_location = ATTACK_BUTTON_LOCATION
             else:
                 wait_for_manual_dismissal()
                 attack_location = ATTACK_BUTTON_LOCATION

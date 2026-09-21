@@ -55,6 +55,11 @@ two health points, it also shows the color it read and whether that matched
 the expected "good" color -- if it doesn't match, it'll ask you to click
 that same point again.
 
+It can be helpful to run the Digital Color Meter app while doing this
+calibration. It will provide a zoomed-in view of the pixel locations. The
+program expects the locations to be solid colors - it can be easy to get an
+aliased pixel which would provide an invalid reading location.
+
 1. **Health point** -- a pixel on the main health bar.
 
    ![Health point](docs/health-point.png)
@@ -92,9 +97,23 @@ that same point again.
 
    <!-- TODO: screenshot of the stash button -->
 
+10. **Tab bar icon, twice** -- the bottom tab bar icons are bright/white
+    when the game is ready for you to attack, and dimmed while an item is
+    on screen. This is an unambiguous, rarity-independent signal for which
+    phase the game is in, so it's used to confirm attack/action taps instead
+    of relying on the item box's own (rarity-dependent) colors. Click the
+    **same spot** on the tab bar once while ready to attack, then again
+    while an item is dropped.
+
+    The recommended location for this is the flap of the backpack for the
+    inventory icon.
+
+    <!-- TODO: screenshot of the tab bar in both states -->
+
 This writes `HEALTH_POINT`, `MAX_HEALTH_POINT`, `DROP_REGION`,
-`EQUIPPED_REGION`, `SELL_BUTTON_LOCATION`, `SALVAGE_BUTTON_LOCATION`, and
-`STASH_BUTTON_LOCATION` into `.env`, merging with (not overwriting) whatever
+`EQUIPPED_REGION`, `SELL_BUTTON_LOCATION`, `SALVAGE_BUTTON_LOCATION`,
+`STASH_BUTTON_LOCATION`, `TAB_BAR_POINT`, `TAB_BAR_READY_COLOR`, and
+`TAB_BAR_DROPPED_COLOR` into `.env`, merging with (not overwriting) whatever
 else is already there.
 
 ## `.env` reference
@@ -112,12 +131,15 @@ script tells you which key and how to add it, then exits (except
 | `SELL_BUTTON_LOCATION` | `x,y` | `1986,783` |
 | `SALVAGE_BUTTON_LOCATION` | `x,y` | `2120,789` |
 | `STASH_BUTTON_LOCATION` | `x,y` | `2142,784` |
+| `TAB_BAR_POINT` | `x,y` | `2000,900` |
+| `TAB_BAR_READY_COLOR` | `r,g,b` | `255,255,255` |
+| `TAB_BAR_DROPPED_COLOR` | `r,g,b` | `120,120,120` |
 | `ACTIONS` | `rarity:action,...` | `crude:sell,sturdy:salvage,enchanted:salvage,mythic:salvage,relic:stash,eldritch:manual` |
 | `REQUIRE_MAX_HEALTH` | `true` or `false` | `false` |
 | `INVENTORY_CAPACITY` | integer | `5` |
 | `INVENTORY_USED` | integer, set to whatever's actually in your inventory when you start | `1` |
 
-The first seven are written by `calibrate`; the last four are hand-edited.
+The first ten are written by `calibrate`; the last four are hand-edited.
 
 Rarity colors (`RARITY_COLORS`) and the tuning constants further down (tap
 timing, match thresholds, etc.) stay in the CONFIG section of `main.py`
