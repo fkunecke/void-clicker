@@ -19,6 +19,28 @@ Grant Terminal (or your IDE) access under:
 - System Settings > Privacy & Security > Input Monitoring (needed for
   `calibrate`'s click detection, separate from Accessibility)
 
+## Before running (any mode)
+
+- The iPhone Mirroring app must already be running and open -- this script
+  only reads/clicks pixels on screen, it doesn't launch or control Mirroring
+  itself.
+- Position the Mirroring window in the **top-left corner of the screen**,
+  and leave it there. All pixel locations are absolute screen coordinates,
+  so if the window moves, everything calibrated against it goes stale.
+- In the Mirroring app, go to **View > Larger** to make everything bigger
+  and easier to hit reliably.
+- In-game, set **Loot Safety Timer Duration to Disabled** -- otherwise the
+  timer can fire in the middle of a loot action and throw things off.
+  `Eldritch & 5 seconds` is a possible alternative if you want the timer on
+  for eldritch drops specifically, but that combination hasn't been tested.
+
+## Known limitations
+
+- No support yet for automatically closing unexpected dialogs (level-ups,
+  confirmations, etc.) that fall outside the normal attack/loot/action flow.
+  Because of this, it can't run fully unmonitored -- stay close enough to
+  handle anything that pops up.
+
 ## Calibration
 
 Pixel locations are machine/screen-specific, so they're kept out of the
@@ -35,32 +57,28 @@ that same point again.
 
 1. **Health point** -- a pixel on the main health bar.
 
-   <!-- TODO: screenshot of where to click for the health point -->
+   ![Health point](docs/health-point.png)
 
 2. **Max health checkpoint** -- a point further along the health bar, at
    roughly the 95% mark. Used to tell "good tier" apart from "actually near
    max" (see `REQUIRE_MAX_HEALTH` below).
 
-   <!-- TODO: screenshot of where to click for the max health checkpoint -->
+   ![Max health checkpoint](docs/max-health-point.png)
 
 3. **Drop region top-left corner** -- the item box is anchored to the
    bottom and grows upward with more stats, so this and the next point mark
    the max bounds the box (and its icon) can ever occupy.
 
-   <!-- TODO: screenshot of the drop region's top-left corner -->
+   ![Drop region bounds](docs/loot-bounds.png)
 
-4. **Drop region bottom-right corner**
-
-   <!-- TODO: screenshot of the drop region's bottom-right corner -->
+4. **Drop region bottom-right corner** -- see the bounds above.
 
 5. **Equipped region top-left corner** -- same idea, for the box comparing
    against your currently equipped item.
 
-   <!-- TODO: screenshot of the equipped region's top-left corner -->
+   ![Equipped region bounds](docs/equipped-bounds.png)
 
-6. **Equipped region bottom-right corner**
-
-   <!-- TODO: screenshot of the equipped region's bottom-right corner -->
+6. **Equipped region bottom-right corner** -- see the bounds above.
 
 7. **Sell button**
 
