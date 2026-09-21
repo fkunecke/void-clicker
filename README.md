@@ -36,10 +36,12 @@ Grant Terminal (or your IDE) access under:
 
 ## Known limitations
 
-- No support yet for automatically closing unexpected dialogs (level-ups,
-  confirmations, etc.) that fall outside the normal attack/loot/action flow.
-  Because of this, it can't run fully unmonitored -- stay close enough to
-  handle anything that pops up.
+- `auto`/`live --close-dialogs` can detect and close dialogs that dim the
+  screen and have a purple-text close button matching `DIALOG_CLOSE_BUTTON_COLOR`
+  (level-ups, confirmations, etc.), but only checks once per cycle (before
+  attacking) -- not mid-poll while waiting on something else. Anything
+  outside that pattern still isn't handled automatically, so it still can't
+  run fully unmonitored -- stay close enough to handle anything unexpected.
 
 ## Calibration
 
@@ -110,11 +112,19 @@ aliased pixel which would provide an invalid reading location.
 
     <!-- TODO: screenshot of the tab bar in both states -->
 
+11. **Dialog close button region, twice** -- the close button on a dialog is
+    horizontally centered but shifts vertically with the dialog's height, so
+    instead of one point this needs the max bounds it could ever appear
+    within. Open the **smallest** dialog you can for the top-left corner,
+    and the **largest/tallest** dialog you can for the bottom-right corner.
+
+    <!-- TODO: screenshot of a small and a large dialog with the close button marked -->
+
 This writes `HEALTH_POINT`, `MAX_HEALTH_POINT`, `DROP_REGION`,
 `EQUIPPED_REGION`, `SELL_BUTTON_LOCATION`, `SALVAGE_BUTTON_LOCATION`,
-`STASH_BUTTON_LOCATION`, `TAB_BAR_POINT`, `TAB_BAR_READY_COLOR`, and
-`TAB_BAR_DROPPED_COLOR` into `.env`, merging with (not overwriting) whatever
-else is already there.
+`STASH_BUTTON_LOCATION`, `TAB_BAR_POINT`, `TAB_BAR_READY_COLOR`,
+`TAB_BAR_DROPPED_COLOR`, and `DIALOG_CLOSE_REGION` into `.env`, merging with
+(not overwriting) whatever else is already there.
 
 ## `.env` reference
 
@@ -134,12 +144,13 @@ script tells you which key and how to add it, then exits (except
 | `TAB_BAR_POINT` | `x,y` | `2000,900` |
 | `TAB_BAR_READY_COLOR` | `r,g,b` | `255,255,255` |
 | `TAB_BAR_DROPPED_COLOR` | `r,g,b` | `120,120,120` |
+| `DIALOG_CLOSE_REGION` | `left,top,right,bottom` | `1900,900,2300,1200` |
 | `ACTIONS` | `rarity:action,...` | `crude:sell,sturdy:salvage,enchanted:salvage,mythic:salvage,relic:stash,eldritch:manual` |
 | `REQUIRE_MAX_HEALTH` | `true` or `false` | `false` |
 | `INVENTORY_CAPACITY` | integer | `5` |
 | `INVENTORY_USED` | integer, set to whatever's actually in your inventory when you start | `1` |
 
-The first ten are written by `calibrate`; the last four are hand-edited.
+The first eleven are written by `calibrate`; the last four are hand-edited.
 
 Rarity colors (`RARITY_COLORS`) and the tuning constants further down (tap
 timing, match thresholds, etc.) stay in the CONFIG section of `main.py`
@@ -148,15 +159,19 @@ itself, since they're not machine-specific in the same way.
 ## Modes
 
 ```
-python3 main.py calibrate         # interactive: click each pixel location
-python3 main.py auto              # default mode: run the monitor/auto-triager
-python3 main.py auto --timing     # like auto, but prints a per-cycle timing breakdown
-python3 main.py live              # same as auto, but for watching/tuning timing
-python3 main.py live --no-click   # like live, but never taps -- you drive, it just verifies detection
-python3 main.py debug             # hover and print live cursor position + color
-python3 main.py debug-drops       # live per-rarity match scores for drop/equipped
-python3 main.py timing            # benchmark actual screen-capture latency
+python3 main.py calibrate                  # interactive: click each pixel location
+python3 main.py auto                       # default mode: run the monitor/auto-triager
+python3 main.py auto --timing              # like auto, but prints a per-cycle timing breakdown
+python3 main.py auto --close-dialogs       # like auto, but auto-closes detected dialogs
+python3 main.py live                       # same as auto, but for watching/tuning timing
+python3 main.py live --no-click            # like live, but never taps -- you drive, it just verifies detection
+python3 main.py live --close-dialogs       # like live, but auto-closes detected dialogs (ignored with --no-click)
+python3 main.py debug                      # hover and print live cursor position + color
+python3 main.py debug-drops                # live per-rarity match scores for drop/equipped
+python3 main.py timing                     # benchmark actual screen-capture latency
 ```
+
+Flags combine, e.g. `python3 main.py auto --timing --close-dialogs`.
 
 `auto` and `live` both print the current `.env`-derived settings (actions,
 inventory, require-max-health) first and wait for a keypress -- press Escape
@@ -168,10 +183,19 @@ while it passively watches the tab bar and shows what it detected (drop,
 equipped, suggested action) for each item -- compare that against what you
 actually saw in-game.
 
+`--close-dialogs` checks for an open dialog (via `HEALTH_POINT` reading as
+dimmed) at the start of every cycle, before anything else -- everything
+else reads as dimmed nonsense while a dialog covers the screen, so it has to
+be handled first. If one's open, it searches `DIALOG_CLOSE_REGION` for the
+close button's purple text and taps it, repeating (up to a few stacked
+dialogs) until none remain. Verify detection first with `debug` (it shows
+live `dialog open:` / `close button:` readings) before trusting this to
+click anything.
+
 `auto --timing` prints one line per cycle like:
 
 ```
-cycle timing: healthy=0.00s attack=0.45s(6 polls) read=0.12s action=0.38s(5 polls) delay=0.05s total=1.00s
+cycle timing: dialog=0.00s healthy=0.00s attack=0.45s(6 polls) read=0.12s action=0.38s(5 polls) delay=0.05s total=1.00s
 ```
 
 `healthy` is time spent waiting for `REQUIRE_MAX_HEALTH`/health-tier gating

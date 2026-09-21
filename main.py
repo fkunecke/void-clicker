@@ -168,6 +168,11 @@ RARITY_TOLERANCE = 25
 DROP_REGION = required_point("DROP_REGION")
 EQUIPPED_REGION = required_point("EQUIPPED_REGION")
 
+# Max bounds the dialog close button's text can ever appear within (it's
+# centered horizontally but shifts vertically with dialog height). See
+# DIALOG_CLOSE_BUTTON_COLOR above / .env / calibrate.
+DIALOG_CLOSE_REGION = required_point("DIALOG_CLOSE_REGION")
+
 # See .env / calibrate.
 SELL_BUTTON_LOCATION = required_point("SELL_BUTTON_LOCATION")
 SALVAGE_BUTTON_LOCATION = required_point("SALVAGE_BUTTON_LOCATION")
@@ -294,6 +299,28 @@ HEALTH_COLORS = {
     "low": (227, 58, 64),
 }
 HEALTH_TOLERANCE = 30
+
+# An open dialog dims everything behind it, so HEALTH_POINT reads as roughly
+# 43-45% of its normal "good" brightness -- a much more reliable signal than
+# trying to tell two similar dark background colors apart (that difference
+# was only ~27 total vs. this one's ~300). Checked separately from the
+# normal good/ok/low tiers since "dialog open" isn't a health state.
+DIALOG_HEALTH_COLOR = (75, 49, 109)
+DIALOG_TOLERANCE = 20
+
+# The dialog's close button isn't at a fixed position -- it's horizontally
+# centered but shifts vertically with the dialog's height, so we can't
+# calibrate a single point like the other buttons. Instead, DIALOG_CLOSE_REGION
+# (see .env / calibrate) is the max bounds the button can ever appear within,
+# and we search it for this purple text color. Unlike the solid rarity icons,
+# text is thin/sparse, so a density-window match (which specifically rejects
+# sparse patterns) won't find it -- instead we average the position of every
+# matching pixel in the region.
+DIALOG_CLOSE_BUTTON_COLOR = (155, 103, 235)
+DIALOG_CLOSE_TOLERANCE = 30
+# Minimum matching pixels in the region before trusting it's really the
+# button (vs. stray noise/anti-aliasing) rather than the dialog being closed.
+DIALOG_CLOSE_MIN_PIXELS = 20
 
 # -------------------------------------------------------
 
@@ -471,13 +498,18 @@ def tap_until_state(location, expected_state, description, timeout, quiet=False,
 
 def debug():
     print("Debug mode. Move your mouse over the iPhone Mirroring window.")
+    print("Also shows live dialog-open detection (checked at HEALTH_POINT) and")
+    print("the detected close button position (searched in DIALOG_CLOSE_REGION),")
+    print("regardless of where the cursor is.")
     print("Press Ctrl+C to stop.\n")
     try:
         while True:
             x, y = pyautogui.position()
             color = get_average_color((x, y, x + 1, y + 1))
             print(f"Position: ({x}, {y})   Color under cursor: "
-                  f"({int(color[0])}, {int(color[1])}, {int(color[2])})")
+                  f"({int(color[0])}, {int(color[1])}, {int(color[2])})   "
+                  f"dialog open: {is_dialog_open()}   "
+                  f"close button: {find_dialog_close_button()}")
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nStopped.")
@@ -543,8 +575,9 @@ def wait_for_click_or_skip(show_live_color=False):
 def calibrate():
     """Interactive calibration: click each requested spot in turn to build up
     HEALTH_POINT, MAX_HEALTH_POINT, DROP_REGION, EQUIPPED_REGION, the
-    sell/salvage/stash button locations, and the tab bar ready/dropped
-    colors. Rarity colors aren't covered here -- use debug for those."""
+    sell/salvage/stash button locations, the tab bar ready/dropped colors,
+    and the dialog close button's search region. Rarity colors aren't
+    covered here -- use debug for those."""
     print("Interactive calibration. Click each requested spot when prompted.")
     print("If a spot is already set in .env, press Space to keep it as-is.")
     print("If clicking does nothing, grant Input Monitoring permission to this")
@@ -635,6 +668,19 @@ def calibrate():
         "the SAME tab bar icon while an ITEM IS DROPPED (icons dimmed)",
         tab_bar_point, existing_point("TAB_BAR_DROPPED_COLOR"))
 
+    print("Now the dialog close button region. It's horizontally centered but")
+    print("shifts vertically with dialog height, so this needs the max bounds it")
+    print("could ever appear within -- open the SMALLEST dialog you can for the")
+    print("top-left corner, and the LARGEST/tallest dialog you can for the")
+    print("bottom-right corner.\n")
+    existing_dialog_close_region = existing_point("DIALOG_CLOSE_REGION")
+    dialog_close_tl = prompt_point(
+        "the DIALOG CLOSE button region TOP-LEFT corner (smallest dialog)",
+        existing_dialog_close_region[:2] if existing_dialog_close_region else None)
+    dialog_close_br = prompt_point(
+        "the DIALOG CLOSE button region BOTTOM-RIGHT corner (largest dialog)",
+        existing_dialog_close_region[2:] if existing_dialog_close_region else None)
+
     save_env({
         "HEALTH_POINT": encode_point(health_point),
         "MAX_HEALTH_POINT": encode_point(max_health_point),
@@ -646,6 +692,8 @@ def calibrate():
         "TAB_BAR_POINT": encode_point(tab_bar_point),
         "TAB_BAR_READY_COLOR": encode_point(tab_bar_ready_color),
         "TAB_BAR_DROPPED_COLOR": encode_point(tab_bar_dropped_color),
+        "DIALOG_CLOSE_REGION": encode_point(
+            (dialog_close_tl[0], dialog_close_tl[1], dialog_close_br[0], dialog_close_br[1])),
     })
     print(f"Saved to {_ENV_PATH}")
 
@@ -763,6 +811,52 @@ def read_health():
     return classify_color(color, HEALTH_COLORS, HEALTH_TOLERANCE)
 
 
+def is_dialog_open():
+    """True if HEALTH_POINT currently reads as dimmed the way it does when a
+    dialog is covering the screen."""
+    color = get_average_color(
+        (HEALTH_POINT[0], HEALTH_POINT[1], HEALTH_POINT[0] + 1, HEALTH_POINT[1] + 1))
+    return color_distance(color, DIALOG_HEALTH_COLOR) <= DIALOG_TOLERANCE * 3
+
+
+def find_dialog_close_button():
+    """Search DIALOG_CLOSE_REGION for the close button's purple text and
+    return its approximate screen coordinates (the centroid of all matching
+    pixels), or None if not enough matching pixels were found. The button
+    isn't at a fixed position, so this searches rather than sampling a point;
+    and since text is sparse (unlike the solid rarity icons), this averages
+    matching pixel positions rather than looking for a dense window."""
+    arr = grab_region_array(DIALOG_CLOSE_REGION)
+    mask = color_mask(arr, DIALOG_CLOSE_BUTTON_COLOR, DIALOG_CLOSE_TOLERANCE)
+    ys, xs = np.nonzero(mask)
+    if len(xs) < DIALOG_CLOSE_MIN_PIXELS:
+        return None
+    left, top = DIALOG_CLOSE_REGION[0], DIALOG_CLOSE_REGION[1]
+    return (left + int(xs.mean()), top + int(ys.mean()))
+
+
+def close_dialog(quiet=False):
+    """Tap the detected close button, confirmed via is_dialog_open() clearing.
+    Returns False without tapping if the button couldn't be found."""
+    button = find_dialog_close_button()
+    if button is None:
+        if not quiet:
+            print(f"[{timestamp()}] dialog detected but close button not found -- can't auto-close.")
+        return False
+    return tap_until(button, lambda: not is_dialog_open(), "dialog close", ACTION_CONFIRM_TIMEOUT, quiet=quiet)
+
+
+def handle_dialogs(quiet=False, max_dialogs=3):
+    """Close any open dialogs (there could be more than one stacked), up to
+    max_dialogs. Returns how many were actually closed."""
+    closed = 0
+    while is_dialog_open() and closed < max_dialogs:
+        if not close_dialog(quiet=quiet):
+            break
+        closed += 1
+    return closed
+
+
 def read_tab_bar_state():
     """'ready' (bright, ok to attack), 'dropped' (dimmed, item showing), or
     None if neither matches."""
@@ -866,7 +960,7 @@ def wait_for_tab_bar(expected_state, quiet=False):
         time.sleep(TAP_POLL_INTERVAL)
 
 
-def run_cycle_loop(display, quiet, dry_run=False, show_timing=False):
+def run_cycle_loop(display, quiet, dry_run=False, show_timing=False, auto_close_dialogs=False):
     """Core attack/read/act loop shared by auto and live -- they differ only in
     how each cycle's status is displayed and whether per-tap logging is shown.
     display(health, inventory_used, total_drops, total_sold, total_salvaged,
@@ -876,6 +970,8 @@ def run_cycle_loop(display, quiet, dry_run=False, show_timing=False):
     just verifies detection tracks what actually happens, via the same tab
     bar signal. inventory/sold/salvaged still track what the suggested
     action WOULD have done, for comparing against what you actually did.
+    auto_close_dialogs is ignored in dry_run, since closing a dialog is
+    itself a click.
 
     If show_timing, prints how long each step of the cycle actually took --
     real timing from a live run, not the synthetic capture-only numbers from
@@ -892,6 +988,13 @@ def run_cycle_loop(display, quiet, dry_run=False, show_timing=False):
 
     while True:
         cycle_start = time.time()
+
+        # 0. Close any dialog before doing anything else -- health/tab bar/
+        # rarity all read as dimmed nonsense while one's covering the screen.
+        step_start = time.time()
+        if auto_close_dialogs and not dry_run:
+            handle_dialogs(quiet=quiet)
+        t_dialog = time.time() - step_start
 
         # 1. Don't attack unless health is ok.
         step_start = time.time()
@@ -967,13 +1070,13 @@ def run_cycle_loop(display, quiet, dry_run=False, show_timing=False):
         if show_timing:
             attack_polls = attack_stats.get("polls", "?") if attack_stats else "n/a"
             action_polls = action_stats.get("polls", "?") if action_stats else "n/a"
-            print(f"[{timestamp()}] cycle timing: healthy={t_healthy:.2f}s "
+            print(f"[{timestamp()}] cycle timing: dialog={t_dialog:.2f}s healthy={t_healthy:.2f}s "
                   f"attack={t_attack:.2f}s({attack_polls} polls) "
                   f"read={t_read:.2f}s action={t_action:.2f}s({action_polls} polls) "
                   f"delay={t_delay:.2f}s total={time.time() - cycle_start:.2f}s")
 
 
-def auto(show_timing=False):
+def auto(show_timing=False, close_dialogs=False):
     if not confirm_settings():
         print("Cancelled.")
         return
@@ -981,14 +1084,15 @@ def auto(show_timing=False):
     print("\nMonitoring. Press Ctrl+C to stop.\n")
 
     try:
-        run_cycle_loop(display=print_status, quiet=False, show_timing=show_timing)
+        run_cycle_loop(display=print_status, quiet=False, show_timing=show_timing,
+                        auto_close_dialogs=close_dialogs)
     except ManualOverride:
         print(f"\n[{timestamp()}] Mouse moved manually -- stopping.")
     except KeyboardInterrupt:
         print("\nStopped.")
 
 
-def live(dry_run=False):
+def live(dry_run=False, close_dialogs=False):
     """Same as auto, but the status block updates in place (no per-tap logging,
     no scrolling) so you can watch real cycle timing without flooding the
     console -- meant for tightening up the timing constants.
@@ -1010,7 +1114,7 @@ def live(dry_run=False):
         state["first"] = False
 
     try:
-        run_cycle_loop(display=display, quiet=True, dry_run=dry_run)
+        run_cycle_loop(display=display, quiet=True, dry_run=dry_run, auto_close_dialogs=close_dialogs)
     except ManualOverride:
         print(f"\n[{timestamp()}] Mouse moved manually -- stopping.")
     except KeyboardInterrupt:
@@ -1019,12 +1123,13 @@ def live(dry_run=False):
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "auto"
+    flags = sys.argv[2:]
     if mode == "calibrate":
         calibrate()
     elif mode == "auto":
-        auto(show_timing="--timing" in sys.argv[2:])
+        auto(show_timing="--timing" in flags, close_dialogs="--close-dialogs" in flags)
     elif mode == "live":
-        live(dry_run="--no-click" in sys.argv[2:])
+        live(dry_run="--no-click" in flags, close_dialogs="--close-dialogs" in flags)
     elif mode == "debug":
         debug()
     elif mode == "debug-drops":
@@ -1032,4 +1137,5 @@ if __name__ == "__main__":
     elif mode == "timing":
         benchmark()
     else:
-        print("Usage: python3 main.py [calibrate|auto [--timing]|live [--no-click]|debug|debug-drops|timing]")
+        print("Usage: python3 main.py [calibrate|auto [--timing] [--close-dialogs]|"
+              "live [--no-click] [--close-dialogs]|debug|debug-drops|timing]")
