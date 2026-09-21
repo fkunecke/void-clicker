@@ -6,32 +6,11 @@ confirmed, clicks the corresponding sell/salvage/stash button per ACTIONS.
 "manual" rarities (currently eldritch) and unrecognized drops are never
 clicked -- left for you to handle by hand.
 
-SETUP (one-time):
-  pip3 install pyautogui mss numpy
-  Then grant Terminal (or your IDE) access under:
-    System Settings > Privacy & Security > Accessibility
-    System Settings > Privacy & Security > Screen Recording
-
-USAGE:
-  1. Calibrate to find pixel coordinates and colors:
-       python3 main.py calibrate
-     Move your mouse around the iPhone Mirroring window; it prints the live
-     cursor position and the pixel color under it, once per second.
-
-  2. Fill in the CONFIG section below with what you found.
-
-  3. If drops aren't being detected, run debug mode with an item visibly
-     dropped/equipped on screen to see per-rarity match scores live:
-       python3 main.py debug
-
-  4. To see how much of the cycle time is actual screen-capture latency
-     (vs. the configured sleep constants), run:
-       python3 main.py timing
-
-  5. Run the monitor:
-       python3 main.py monitor
+See README.md for setup, calibration, .env format, and the available modes
+(calibrate, auto, debug, debug-drops, timing).
 """
 
+import os
 import sys
 import time
 from datetime import datetime
@@ -43,6 +22,97 @@ import pyautogui
 # its own setup overhead, so reuse it across every grab in the process.
 _sct = mss.mss()
 
+# Machine/session-specific settings (calibrated pixel locations, and the
+# gameplay settings below that you might tune between sessions) live in a
+# local .env file next to this script rather than as hardcoded constants
+# here. No fallback defaults: these must be set in .env, since a wrong guess
+# here fails silently and confusingly rather than erroring.
+_ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def load_env():
+    """Read .env as a flat dict of key -> raw string value."""
+    if not os.path.exists(_ENV_PATH):
+        return {}
+    env = {}
+    with open(_ENV_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, raw = line.partition("=")
+            env[key.strip()] = raw.strip()
+    return env
+
+
+def save_env(updates):
+    """Merge updates into the existing .env (preserving unrelated keys) and
+    write the result back."""
+    env = load_env()
+    env.update(updates)
+    lines = ["# Managed by main.py -- calibrate writes pixel locations here;"
+              " the rest can be hand-edited."]
+    lines += [f"{key}={value}" for key, value in env.items()]
+    with open(_ENV_PATH, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+_env = load_env()
+_mode = sys.argv[1] if len(sys.argv) > 1 else "auto"
+
+
+def required_raw(key, hint):
+    """Fetch a raw string value from .env -- no fallback. If it's missing, tell
+    the user how to add it and stop, unless calibrate is the thing currently
+    running (it produces the pixel-location keys, so can't depend on them
+    already being set)."""
+    if key in _env:
+        return _env[key]
+    if _mode == "calibrate":
+        return None
+    print(f"{key} is not set in .env. {hint}")
+    sys.exit(1)
+
+
+def encode_point(value):
+    return ",".join(str(n) for n in value)
+
+
+def parse_point(raw):
+    return None if raw is None else tuple(int(n) for n in raw.split(","))
+
+
+def parse_int(raw):
+    return None if raw is None else int(raw)
+
+
+def parse_bool(raw):
+    return None if raw is None else raw.strip().lower() == "true"
+
+
+def encode_actions(actions):
+    return ",".join(f"{rarity}:{action}" for rarity, action in actions.items())
+
+
+def parse_actions(raw):
+    if raw is None:
+        return None
+    actions = {}
+    for pair in raw.split(","):
+        if not pair.strip():
+            continue
+        rarity, _, action = pair.partition(":")
+        actions[rarity.strip()] = action.strip()
+    return actions
+
+
+CALIBRATE_HINT = "Run `python3 main.py calibrate` first."
+
+
+def required_point(key):
+    return parse_point(required_raw(key, CALIBRATE_HINT))
+
+
 # ---------------- CONFIG (edit these) ----------------
 
 # Reference RGB color for each rarity tier's icon background.
@@ -53,26 +123,30 @@ RARITY_COLORS = {
     "enchanted": (26, 98, 204),
     "mythic": (99, 11, 149),
     "relic": (246, 178, 20),
-    "eldritch": (255, 0, 0),
+    "eldritch": (155, 25, 33), # approximate
 }
 
 # Suggested triage per rarity. "manual" means: don't suggest anything, just
 # surface it so it can be looked at directly (eldritch is rare enough to
-# want eyes on it).
-ACTIONS = {
-    "crude": "sell",
-    "sturdy": "salvage",
-    "enchanted": "salvage",
-    "mythic": "stash",
-    "relic": "stash",
-    "eldritch": "manual",
-}
+# want eyes on it). Set in .env as e.g.
+# ACTIONS=crude:sell,sturdy:salvage,enchanted:salvage,mythic:salvage,relic:stash,eldritch:manual
+ACTIONS = parse_actions(required_raw(
+    "ACTIONS", "Add it to .env, e.g. ACTIONS=crude:sell,sturdy:salvage,relic:stash,eldritch:manual"))
 
-# Inventory tracking is manual: set INVENTORY_USED to whatever's actually in
-# your inventory when you start the script. From there, every "stash" action
-# increments it by 1 for the rest of the session.
-INVENTORY_CAPACITY = 5
-INVENTORY_USED = 2
+# Pixels to sample for the health bar/indicator color. See .env / calibrate.
+HEALTH_POINT = required_point("HEALTH_POINT")
+MAX_HEALTH_POINT = required_point("MAX_HEALTH_POINT")
+
+# Inventory tracking is manual: set INVENTORY_USED in .env to whatever's
+# actually in your inventory when you start the script. From there, every
+# "stash" action increments it by 1 for the rest of the session.
+INVENTORY_CAPACITY = parse_int(required_raw("INVENTORY_CAPACITY", "Add it to .env, e.g. INVENTORY_CAPACITY=5."))
+INVENTORY_USED = parse_int(required_raw("INVENTORY_USED", "Add it to .env, e.g. INVENTORY_USED=0."))
+
+# If True, attacking also requires the bar to be filled to MAX_HEALTH_POINT
+# (near max), not just in the "good" tier overall. Set in .env as true/false.
+REQUIRE_MAX_HEALTH = parse_bool(required_raw(
+    "REQUIRE_MAX_HEALTH", "Add it to .env as REQUIRE_MAX_HEALTH=true or REQUIRE_MAX_HEALTH=false."))
 
 # How close a sampled color needs to be to a reference color to count as a
 # match (0 = exact only; higher = more tolerant of variation). Distance is
@@ -84,12 +158,13 @@ RARITY_TOLERANCE = 25
 # has more stats -- the icon's position shifts and isn't a fixed offset from
 # either corner. These regions are the max bounds the box (and therefore the
 # icon) can ever occupy; we search inside them rather than sampling a point.
-DROP_REGION = (1947, 472, 2120, 740)
-EQUIPPED_REGION = (2133, 472, 2306, 740)
+DROP_REGION = required_point("DROP_REGION")
+EQUIPPED_REGION = required_point("EQUIPPED_REGION")
 
-SELL_BUTTON_LOCATION = (1986, 783)
-SALVAGE_BUTTON_LOCATION = (2120, 789)
-STASH_BUTTON_LOCATION = (2142, 784)
+# See .env / calibrate.
+SELL_BUTTON_LOCATION = required_point("SELL_BUTTON_LOCATION")
+SALVAGE_BUTTON_LOCATION = required_point("SALVAGE_BUTTON_LOCATION")
+STASH_BUTTON_LOCATION = required_point("STASH_BUTTON_LOCATION")
 
 # Where to click for each action. Actions with no entry here (currently just
 # "manual") are never clicked -- same for an unrecognized/None action, e.g.
@@ -175,19 +250,6 @@ MIN_RARITY_FRACTION = 0.4
 # below the former and well above the latter.
 MIN_COMBINED_FRACTION = 0.75
 
-# Pixel to sample for the health bar/indicator color.
-HEALTH_POINT = (1953, 206)
-
-# A checkpoint further along the health bar, at roughly the 95% mark. If
-# health has filled the bar out this far, this pixel reads the same "good"
-# color as HEALTH_POINT; otherwise it's past the fill and reads the bar's
-# empty/background color. Lets us distinguish "good tier" from "near max"
-# instead of just the coarse good/ok/low tier.
-MAX_HEALTH_POINT = (2074, 206)
-
-# If True, attacking also requires the bar to be filled to MAX_HEALTH_POINT
-# (near max), not just in the "good" tier overall.
-REQUIRE_MAX_HEALTH = True
 
 # If the user is hovering over a non-UI element it will probably be close to
 # this color (useful during calibration to confirm you're on/off a real
@@ -376,8 +438,8 @@ def tap_until_stable(location, sample, description, timeout):
     return None
 
 
-def calibrate():
-    print("Calibrate mode. Move your mouse over the iPhone Mirroring window.")
+def debug():
+    print("Debug mode. Move your mouse over the iPhone Mirroring window.")
     print("Press Ctrl+C to stop.\n")
     try:
         while True:
@@ -390,8 +452,74 @@ def calibrate():
         print("\nStopped.")
 
 
-def debug_scan():
-    print("Debug mode: best match density per rarity, for each region, every second.")
+def wait_for_click():
+    """Block until the next real mouse click anywhere on screen; return its (x, y)."""
+    from pynput import mouse
+
+    clicked_at = {}
+
+    def on_click(x, y, button, pressed):
+        if pressed:
+            clicked_at["pos"] = (int(x), int(y))
+            return False  # stop the listener
+
+    with mouse.Listener(on_click=on_click) as listener:
+        listener.join()
+    return clicked_at["pos"]
+
+
+def calibrate():
+    """Interactive calibration: click each requested spot in turn to build up
+    HEALTH_POINT, MAX_HEALTH_POINT, DROP_REGION, EQUIPPED_REGION, and the
+    sell/salvage/stash button locations. Rarity colors aren't covered here --
+    use debug for those."""
+    print("Interactive calibration. Click each requested spot when prompted.")
+    print("If clicking does nothing, grant Input Monitoring permission to this")
+    print("terminal/IDE under System Settings > Privacy & Security.\n")
+
+    def prompt_point(label):
+        print(f"Click {label}...")
+        x, y = wait_for_click()
+        print(f"  -> ({x}, {y})\n")
+        return (x, y)
+
+    def prompt_health_point(label):
+        while True:
+            print(f"Click {label}...")
+            x, y = wait_for_click()
+            color = get_average_color((x, y, x + 1, y + 1))
+            clicked = tuple(int(c) for c in color)
+            expected = HEALTH_COLORS["good"]
+            matches = color_distance(clicked, expected) <= HEALTH_TOLERANCE * 3
+            print(f"  -> ({x}, {y})  clicked={clicked}  expected(good)={expected}  "
+                  f"{'MATCH' if matches else 'NO MATCH -- try again'}\n")
+            if matches:
+                return (x, y)
+
+    health_point = prompt_health_point("the HEALTH point (main health bar)")
+    max_health_point = prompt_health_point("the MAX HEALTH checkpoint (~95% mark on the health bar)")
+    drop_tl = prompt_point("the DROP region TOP-LEFT corner")
+    drop_br = prompt_point("the DROP region BOTTOM-RIGHT corner")
+    equipped_tl = prompt_point("the EQUIPPED region TOP-LEFT corner")
+    equipped_br = prompt_point("the EQUIPPED region BOTTOM-RIGHT corner")
+    sell_button = prompt_point("the SELL button")
+    salvage_button = prompt_point("the SALVAGE button")
+    stash_button = prompt_point("the STASH button")
+
+    save_env({
+        "HEALTH_POINT": encode_point(health_point),
+        "MAX_HEALTH_POINT": encode_point(max_health_point),
+        "DROP_REGION": encode_point((drop_tl[0], drop_tl[1], drop_br[0], drop_br[1])),
+        "EQUIPPED_REGION": encode_point((equipped_tl[0], equipped_tl[1], equipped_br[0], equipped_br[1])),
+        "SELL_BUTTON_LOCATION": encode_point(sell_button),
+        "SALVAGE_BUTTON_LOCATION": encode_point(salvage_button),
+        "STASH_BUTTON_LOCATION": encode_point(stash_button),
+    })
+    print(f"Saved to {_ENV_PATH}")
+
+
+def debug_drops():
+    print("Debug-drops mode: best match density per rarity, for each region, every second.")
     print("Point the game at a visible drop/equipped comparison and watch the numbers.")
     print("Press Ctrl+C to stop.\n")
     try:
@@ -497,8 +625,41 @@ def wait_for_healthy():
     print(f"[{timestamp()}] health is high enough, resuming.")
 
 
-def monitor():
-    print("Monitoring. Press Ctrl+C to stop.\n")
+def read_single_key():
+    """Read one raw keypress from stdin without waiting for Enter (macOS/Unix)."""
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        return sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+ESCAPE_KEY = "\x1b"
+
+
+def confirm_settings():
+    """Show the settings that came from .env and let the user bail out to
+    edit them by hand before anything starts clicking."""
+    print("Current settings (from .env):")
+    print(f"  actions: {ACTIONS}")
+    print(f"  inventory: {INVENTORY_USED}/{INVENTORY_CAPACITY}")
+    print(f"  require max health: {REQUIRE_MAX_HEALTH}")
+    print()
+    print("Press Escape to cancel and edit .env yourself, or any other key to continue...")
+    return read_single_key() != ESCAPE_KEY
+
+
+def auto():
+    if not confirm_settings():
+        print("Cancelled.")
+        return
+
+    print("\nMonitoring. Press Ctrl+C to stop.\n")
 
     inventory_used = INVENTORY_USED
     total_drops = 0
@@ -559,14 +720,16 @@ def monitor():
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "monitor"
+    mode = sys.argv[1] if len(sys.argv) > 1 else "auto"
     if mode == "calibrate":
         calibrate()
-    elif mode == "monitor":
-        monitor()
+    elif mode == "auto":
+        auto()
     elif mode == "debug":
-        debug_scan()
+        debug()
+    elif mode == "debug-drops":
+        debug_drops()
     elif mode == "timing":
         benchmark()
     else:
-        print("Usage: python3 main.py [calibrate|monitor|debug|timing]")
+        print("Usage: python3 main.py [calibrate|auto|debug|debug-drops|timing]")
